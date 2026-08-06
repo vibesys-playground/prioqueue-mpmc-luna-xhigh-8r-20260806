@@ -378,3 +378,12 @@ Rewrote `SlotIndexHeap::push` in `src/lib.rs` as a raw-pointer sift-up. Parent e
 ### Summary
 Rewrote SlotIndexHeap::push with raw-pointer sift-up, shift-based parent arithmetic, and one final entry write. Build, tests, ABI checks, and native probes passed. Go evaluator was unavailable; native median was 1,748,222 ops/s.
 
+## Round 6 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+Build succeeds and produces ./priority-queue-candidate.so with all required ABI symbols. Rust tests, ABI probes across inline, non-word-aligned, and 1 MiB values, and all four trusted 100-trial accuracy scenarios pass. Source inspection confirms preallocated allocation-free heap push, minimum-priority ordering, permitted equal-priority tie-breaking, inline ≤8-byte storage, lazy reusable larger storage, and no benchmark-specific shortcut. However, the exact MPMC benchmark samples were 1,833,609, 2,272,899, and 1,891,056 total_ops_per_sec, giving a median of 1,891,056, which is below the required strict threshold of 2,190,294.
+
+### Feedback
+Improve end-to-end MPMC throughput so the exact three-repetition benchmark median is strictly above 2,190,294 total_ops_per_sec. Correctness and allocation/priority criteria currently pass.
+
