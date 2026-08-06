@@ -4,9 +4,7 @@ mod ffi;
 
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
-use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
-use std::ptr::{read_unaligned, write_unaligned};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -19,76 +17,15 @@ const STATUS_INTERNAL_ERROR: u32 = 4;
 
 const INLINE_VALUE_CAPACITY: usize = 8;
 
-#[inline(always)]
-fn copy_inline_bytes(destination: &mut [u8], source: &[u8]) {
-    debug_assert_eq!(destination.len(), source.len());
-    debug_assert!(source.len() <= INLINE_VALUE_CAPACITY);
-    let length = source.len();
-    let destination = destination.as_mut_ptr();
-    let source = source.as_ptr();
-    unsafe {
-        match length {
-            0 => {}
-            1 => write_unaligned(destination, read_unaligned(source)),
-            2 => write_unaligned(
-                destination.cast::<u16>(),
-                read_unaligned(source.cast::<u16>()),
-            ),
-            3 => {
-                write_unaligned(
-                    destination.cast::<u16>(),
-                    read_unaligned(source.cast::<u16>()),
-                );
-                write_unaligned(destination.add(2), read_unaligned(source.add(2)));
-            }
-            4 => write_unaligned(
-                destination.cast::<u32>(),
-                read_unaligned(source.cast::<u32>()),
-            ),
-            5 => {
-                write_unaligned(
-                    destination.cast::<u32>(),
-                    read_unaligned(source.cast::<u32>()),
-                );
-                write_unaligned(destination.add(4), read_unaligned(source.add(4)));
-            }
-            6 => {
-                write_unaligned(
-                    destination.cast::<u32>(),
-                    read_unaligned(source.cast::<u32>()),
-                );
-                write_unaligned(
-                    destination.add(4).cast::<u16>(),
-                    read_unaligned(source.add(4).cast::<u16>()),
-                );
-            }
-            7 => {
-                write_unaligned(
-                    destination.cast::<u32>(),
-                    read_unaligned(source.cast::<u32>()),
-                );
-                write_unaligned(
-                    destination.add(4).cast::<u16>(),
-                    read_unaligned(source.add(4).cast::<u16>()),
-                );
-                write_unaligned(destination.add(6), read_unaligned(source.add(6)));
-            }
-            8 => write_unaligned(
-                destination.cast::<u64>(),
-                read_unaligned(source.cast::<u64>()),
-            ),
-            _ => unreachable!(),
-        }
-    }
-}
-
 enum SlotStorage {
-    Inline { bytes: [u8; INLINE_VALUE_CAPACITY] },
+    Inline {
+        bytes: [u8; INLINE_VALUE_CAPACITY],
+        length: usize,
+    },
     Heap(Vec<u8>),
 }
 
 struct Slot {
-    length: usize,
     storage: SlotStorage,
 }
 
@@ -97,21 +34,22 @@ impl Slot {
         let storage = if max_value_size <= INLINE_VALUE_CAPACITY {
             SlotStorage::Inline {
                 bytes: [0; INLINE_VALUE_CAPACITY],
+                length: 0,
             }
         } else {
             // Keep the larger-value path lazy: the reusable Vec obtains its
             // backing allocation only when a value is first copied into it.
             SlotStorage::Heap(Vec::new())
         };
-        Self { length: 0, storage }
+        Self { storage }
     }
 
     fn copy_value(&mut self, data: &[u8]) -> Result<(), ()> {
         match &mut self.storage {
-            SlotStorage::Inline { bytes } => {
+            SlotStorage::Inline { bytes, length } => {
                 debug_assert!(data.len() <= INLINE_VALUE_CAPACITY);
-                copy_inline_bytes(&mut bytes[..data.len()], data);
-                self.length = data.len();
+                bytes[..data.len()].copy_from_slice(data);
+                *length = data.len();
                 Ok(())
             }
             SlotStorage::Heap(value) => {
@@ -120,7 +58,6 @@ impl Slot {
                     value.try_reserve_exact(data.len()).map_err(|_| ())?;
                 }
                 value.extend_from_slice(data);
-                self.length = data.len();
                 Ok(())
             }
         }
@@ -128,26 +65,30 @@ impl Slot {
 
     #[inline]
     fn len(&self) -> usize {
-        self.length
+        match &self.storage {
+            SlotStorage::Inline { length, .. } => *length,
+            SlotStorage::Heap(value) => value.len(),
+        }
     }
 
     #[inline]
     fn copy_to(&self, output: &mut [u8]) {
-        debug_assert_eq!(self.length, output.len());
         match &self.storage {
-            SlotStorage::Inline { bytes } => {
-                copy_inline_bytes(output, &bytes[..self.length]);
+            SlotStorage::Inline { bytes, length } => {
+                debug_assert_eq!(*length, output.len());
+                output.copy_from_slice(&bytes[..*length]);
             }
             SlotStorage::Heap(value) => {
+                debug_assert_eq!(value.len(), output.len());
                 output.copy_from_slice(value);
             }
         }
     }
 
     fn clear(&mut self) {
-        self.length = 0;
-        if let SlotStorage::Heap(value) = &mut self.storage {
-            value.clear();
+        match &mut self.storage {
+            SlotStorage::Inline { length, .. } => *length = 0,
+            SlotStorage::Heap(value) => value.clear(),
         }
     }
 }
@@ -155,7 +96,6 @@ impl Slot {
 #[repr(align(64))]
 struct SpinMutex<T> {
     locked: AtomicBool,
-    _lock_padding: [u8; 63],
     value: UnsafeCell<T>,
 }
 
@@ -167,7 +107,6 @@ impl<T> SpinMutex<T> {
     fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
-            _lock_padding: [0; 63],
             value: UnsafeCell::new(value),
         }
     }
@@ -217,136 +156,70 @@ impl<T> Drop for SpinMutexGuard<'_, T> {
     }
 }
 
-// The publication lock is the queue's remaining shared hot spot. Keep its
-// heap as a fixed-capacity array of the complete publication records so heap
-// maintenance never has to touch slot payload storage or allocate.
-struct PublishedEntryHeap {
-    entries: Vec<MaybeUninit<PublishedEntry>>,
-    length: usize,
+struct SlotIndexHeap {
+    entries: Vec<PublishedEntry>,
 }
 
-const HEAP_ARITY: usize = 4;
-const HEAP_ARITY_SHIFT: usize = 2;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct PublishedEntry {
     priority: u64,
     slot_index: usize,
 }
 
-impl PublishedEntryHeap {
+impl SlotIndexHeap {
     fn new(capacity: usize) -> Result<Self, u32> {
-        let mut entries = Vec::<MaybeUninit<PublishedEntry>>::new();
+        let mut entries = Vec::new();
         entries
             .try_reserve_exact(capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        // The backing vector is fixed at queue creation. Only `length` is
-        // changed by heap operations; the spare slots are intentionally
-        // uninitialized so queue construction does not materialize entries.
-        unsafe { entries.set_len(capacity) };
-        Ok(Self { entries, length: 0 })
+        Ok(Self { entries })
     }
 
     #[inline]
     fn peek(&self) -> Option<PublishedEntry> {
-        (self.length != 0).then(|| unsafe { self.entry(0) })
-    }
-
-    #[inline(always)]
-    unsafe fn entry(&self, index: usize) -> PublishedEntry {
-        unsafe { self.entries.get_unchecked(index).assume_init_read() }
-    }
-
-    #[inline(always)]
-    unsafe fn write_entry(&mut self, index: usize, entry: PublishedEntry) {
-        unsafe { self.entries.get_unchecked_mut(index).write(entry) };
+        self.entries.first().copied()
     }
 
     #[inline]
     fn push(&mut self, entry: PublishedEntry) {
-        let mut child = self.length;
-        debug_assert!(child < self.entries.len());
-        self.length = child + 1;
+        self.entries.push(entry);
+        let mut child = self.entries.len() - 1;
         while child != 0 {
-            let parent = (child - 1) >> HEAP_ARITY_SHIFT;
-            let parent_entry = unsafe { self.entry(parent) };
-            if !comes_before(entry, parent_entry) {
+            let parent = (child - 1) / 2;
+            if !comes_before(self.entries[child], self.entries[parent]) {
                 break;
             }
-            unsafe { self.write_entry(child, parent_entry) };
+            self.entries.swap(child, parent);
             child = parent;
         }
-        unsafe { self.write_entry(child, entry) };
     }
 
     #[inline]
     fn pop(&mut self) -> Option<PublishedEntry> {
-        let length = self.length;
-        if length == 0 {
-            return None;
-        }
-        let root = unsafe { self.entry(0) };
-        let new_length = length - 1;
-        self.length = new_length;
-        if new_length != 0 {
-            let last = unsafe { self.entry(new_length) };
-            let mut parent = 0;
-
-            // In a full child group, the single loop condition is enough to
-            // establish all four child bounds. This is the common path for a
-            // queue-sized heap and avoids three bounds branches per level.
-            while new_length >= HEAP_ARITY + 1
-                && parent <= (new_length - (HEAP_ARITY + 1)) >> HEAP_ARITY_SHIFT
-            {
-                let first_child = (parent << HEAP_ARITY_SHIFT) + 1;
-                let mut child = first_child;
-                let mut child_entry = unsafe { self.entry(child) };
-
-                let candidate = unsafe { self.entry(first_child + 1) };
-                if comes_before(candidate, child_entry) {
-                    child = first_child + 1;
-                    child_entry = candidate;
+        let root = self.entries.first().copied()?;
+        let last = self.entries.pop().expect("heap root implies a last item");
+        if !self.entries.is_empty() {
+            let mut hole = 0;
+            loop {
+                let left = hole * 2 + 1;
+                if left >= self.entries.len() {
+                    break;
                 }
-                let candidate = unsafe { self.entry(first_child + 2) };
-                if comes_before(candidate, child_entry) {
-                    child = first_child + 2;
-                    child_entry = candidate;
+                let right = left + 1;
+                let child = if right < self.entries.len()
+                    && comes_before(self.entries[right], self.entries[left])
+                {
+                    right
+                } else {
+                    left
+                };
+                if !comes_before(self.entries[child], last) {
+                    break;
                 }
-                let candidate = unsafe { self.entry(first_child + 3) };
-                if comes_before(candidate, child_entry) {
-                    child = first_child + 3;
-                    child_entry = candidate;
-                }
-                if !comes_before(child_entry, last) {
-                    unsafe { self.write_entry(parent, last) };
-                    return Some(root);
-                }
-                unsafe { self.write_entry(parent, child_entry) };
-                parent = child;
+                self.entries[hole] = self.entries[child];
+                hole = child;
             }
-
-            // Only the final partial child group needs per-child bounds
-            // checks. It has at most three comparisons and normally executes
-            // once.
-            let first_child = (parent << HEAP_ARITY_SHIFT) + 1;
-            if first_child < new_length {
-                let mut child = first_child;
-                let mut child_entry = unsafe { self.entry(child) };
-                let mut next_child = first_child + 1;
-                while next_child < new_length {
-                    let candidate = unsafe { self.entry(next_child) };
-                    if comes_before(candidate, child_entry) {
-                        child = next_child;
-                        child_entry = candidate;
-                    }
-                    next_child += 1;
-                }
-                if comes_before(child_entry, last) {
-                    unsafe { self.write_entry(parent, child_entry) };
-                    parent = child;
-                }
-            }
-            unsafe { self.write_entry(parent, last) };
+            self.entries[hole] = last;
         }
         Some(root)
     }
@@ -359,34 +232,11 @@ fn comes_before(left: PublishedEntry, right: PublishedEntry) -> bool {
 }
 
 struct ReservationState {
-    free_slots: FreeSlotStack,
-}
-
-struct FreeSlotStack {
-    slots: Vec<usize>,
-    length: usize,
-}
-
-impl FreeSlotStack {
-    #[inline]
-    fn pop(&mut self) -> Option<usize> {
-        if self.length == 0 {
-            return None;
-        }
-        self.length -= 1;
-        Some(unsafe { *self.slots.get_unchecked(self.length) })
-    }
-
-    #[inline]
-    fn push(&mut self, slot_index: usize) {
-        debug_assert!(self.length < self.slots.len());
-        unsafe { *self.slots.get_unchecked_mut(self.length) = slot_index };
-        self.length += 1;
-    }
+    free_slots: Vec<usize>,
 }
 
 struct PublishedState {
-    heap: PublishedEntryHeap,
+    heap: SlotIndexHeap,
 }
 
 struct QueueState {
@@ -450,10 +300,6 @@ impl Queue {
         for index in (0..capacity).rev() {
             free_slots.push(index);
         }
-        let free_slots = FreeSlotStack {
-            slots: free_slots,
-            length: capacity,
-        };
 
         Ok(Self {
             producer_count,
@@ -463,7 +309,7 @@ impl Queue {
                 slots,
                 reservation: SpinMutex::new(ReservationState { free_slots }),
                 published: SpinMutex::new(PublishedState {
-                    heap: PublishedEntryHeap::new(capacity)?,
+                    heap: SlotIndexHeap::new(capacity)?,
                 }),
             }),
         })
@@ -645,188 +491,5 @@ mod tests {
         let mut output = [0_u8; 7];
         slot.copy_to(&mut output);
         assert_eq!(output, [0x22; 7]);
-    }
-
-    #[test]
-    fn four_way_heap_preserves_entry_order_and_capacity() {
-        let mut heap = PublishedEntryHeap::new(16).unwrap();
-        let initial_capacity = heap.entries.capacity();
-        let entries = [
-            PublishedEntry {
-                priority: 9,
-                slot_index: 14,
-            },
-            PublishedEntry {
-                priority: 1,
-                slot_index: 11,
-            },
-            PublishedEntry {
-                priority: 4,
-                slot_index: 3,
-            },
-            PublishedEntry {
-                priority: 1,
-                slot_index: 2,
-            },
-            PublishedEntry {
-                priority: 7,
-                slot_index: 8,
-            },
-            PublishedEntry {
-                priority: 1,
-                slot_index: 7,
-            },
-            PublishedEntry {
-                priority: 4,
-                slot_index: 1,
-            },
-            PublishedEntry {
-                priority: 0,
-                slot_index: 15,
-            },
-            PublishedEntry {
-                priority: 12,
-                slot_index: 0,
-            },
-            PublishedEntry {
-                priority: 4,
-                slot_index: 12,
-            },
-            PublishedEntry {
-                priority: 2,
-                slot_index: 6,
-            },
-            PublishedEntry {
-                priority: 2,
-                slot_index: 5,
-            },
-            PublishedEntry {
-                priority: 8,
-                slot_index: 10,
-            },
-            PublishedEntry {
-                priority: 3,
-                slot_index: 4,
-            },
-            PublishedEntry {
-                priority: 6,
-                slot_index: 9,
-            },
-            PublishedEntry {
-                priority: 5,
-                slot_index: 13,
-            },
-        ];
-        for entry in entries {
-            heap.push(entry);
-            assert_eq!(heap.entries.capacity(), initial_capacity);
-        }
-
-        for expected in [
-            PublishedEntry {
-                priority: 0,
-                slot_index: 15,
-            },
-            PublishedEntry {
-                priority: 1,
-                slot_index: 2,
-            },
-            PublishedEntry {
-                priority: 1,
-                slot_index: 7,
-            },
-            PublishedEntry {
-                priority: 1,
-                slot_index: 11,
-            },
-            PublishedEntry {
-                priority: 2,
-                slot_index: 5,
-            },
-            PublishedEntry {
-                priority: 2,
-                slot_index: 6,
-            },
-            PublishedEntry {
-                priority: 3,
-                slot_index: 4,
-            },
-            PublishedEntry {
-                priority: 4,
-                slot_index: 1,
-            },
-            PublishedEntry {
-                priority: 4,
-                slot_index: 3,
-            },
-            PublishedEntry {
-                priority: 4,
-                slot_index: 12,
-            },
-            PublishedEntry {
-                priority: 5,
-                slot_index: 13,
-            },
-            PublishedEntry {
-                priority: 6,
-                slot_index: 9,
-            },
-            PublishedEntry {
-                priority: 7,
-                slot_index: 8,
-            },
-            PublishedEntry {
-                priority: 8,
-                slot_index: 10,
-            },
-            PublishedEntry {
-                priority: 9,
-                slot_index: 14,
-            },
-            PublishedEntry {
-                priority: 12,
-                slot_index: 0,
-            },
-        ] {
-            let actual = heap.pop().expect("entry conservation");
-            assert_eq!(actual.priority, expected.priority);
-            assert_eq!(actual.slot_index, expected.slot_index);
-            assert_eq!(heap.entries.capacity(), initial_capacity);
-        }
-        assert!(heap.pop().is_none());
-    }
-
-    #[test]
-    fn four_way_heap_handles_all_child_group_shapes() {
-        for capacity in 1..=128 {
-            let mut heap = PublishedEntryHeap::new(capacity).unwrap();
-            let mut expected = Vec::with_capacity(capacity);
-            let mut state = capacity as u64;
-            for slot_index in 0..capacity {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                let entry = PublishedEntry {
-                    priority: state ^ (state >> 29),
-                    slot_index,
-                };
-                heap.push(entry);
-                expected.push(entry);
-            }
-            expected.sort_by(|left, right| {
-                if comes_before(*left, *right) {
-                    std::cmp::Ordering::Less
-                } else if comes_before(*right, *left) {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            });
-
-            for expected_entry in expected {
-                assert_eq!(heap.pop(), Some(expected_entry));
-            }
-            assert!(heap.pop().is_none());
-        }
     }
 }
