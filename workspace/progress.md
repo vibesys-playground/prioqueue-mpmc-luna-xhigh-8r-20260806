@@ -307,3 +307,12 @@ Implemented the M6 minimum-removal path in `src/lib.rs` with a carried `Publishe
 ### Summary
 Implemented M6 hole-style heap removal in src/lib.rs, preserving comparator, preallocation, split locks, slot storage, ABI, and queue semantics. Tests, build, probes, and progress summary completed.
 
+## Round 5 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+Builds successfully and exports the required ABI. Rust tests, evaluator tests, native ABI probes, and the 100-trial all-scenario trusted accuracy gate pass, including priority ordering, ownership, bounds, reservation-aware MPMC behavior, and conservation. Source inspection confirms preallocated heap metadata, inline storage for sizes up to 8, lazy reusable storage for larger values, and no benchmark-specific shortcut. However, the exact default 4P/4C benchmark reported samples of 1484830.788183, 1945975.027547, and 1532869.322141 total_ops_per_sec, with median 1532869.322141, below the required strict threshold of 2190294.
+
+### Feedback
+Improve end-to-end default MPMC throughput so the exact three-repetition benchmark median is strictly greater than 2,190,294 ops/s. Profile and reduce publication-heap and reservation-lock contention, then rerun the evaluator benchmark and accuracy gate.
+
