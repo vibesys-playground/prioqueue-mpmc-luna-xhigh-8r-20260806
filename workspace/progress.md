@@ -414,3 +414,12 @@ Release tests, shared-library build, ABI symbol checks, and native probes for sm
 ### Summary
 Implemented synchronized sharded publication in src/lib.rs with exact global-min validation, versioned root summaries supporting u64::MAX, deterministic shard routing, and publication-only EMPTY handling. Tests, builds, ABI checks, and native probes passed; progress.md was updated.
 
+## Round 8 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully, exports all required ABI symbols, and passes Rust tests plus trusted native probes covering capacities below the shard count, inline/non-word-aligned values, 257-byte and 1 MiB values, ownership, bounds, retention, and concurrent dequeue behavior. Source inspection confirms two publication shards, shard-local enqueue publication, versioned root summaries, and no benchmark shortcut. The official Go accuracy harness could not compile because the available GOROOT lacks cmp and slices. Equivalent trusted native default 4P/4C MPMC benchmark runs were valid but below the required baseline: first set median 5,486,246 ops/s and second set median 4,657,558 ops/s, versus 6,179,290.
+
+### Feedback
+Improve default 4P/4C MPMC end-to-end throughput so the trusted benchmark median exceeds 6,179,290 ops/s; the current sharded publication/root-scan path regresses performance. Re-run the full official accuracy gate once a Go toolchain containing cmp and slices is available.
+
