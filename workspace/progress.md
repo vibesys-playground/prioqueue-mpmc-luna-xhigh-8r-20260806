@@ -283,3 +283,12 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 ### Summary
 Implemented M8 contention-aware SpinMutex locking with bounded spinning and scheduler yielding. Queue semantics and ABI remain unchanged. Tests, build, ABI checks, and native probes passed.
 
+## Round 7 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The candidate builds priority-queue-candidate.so, exports the required ABI, and release tests pass. Source inspection shows the queue semantics and ownership/publication structure remain unchanged; SpinMutex uses Acquire/Release ordering, bounded spinning, yielding, and eventual retry. Native probes pass for benchmark and large/non-word-aligned value sizes, including bounds, ownership, and concurrent retention checks. The full Go accuracy checker could not run because the installed Go standard library is missing cmp and slices. Three valid unpinned default MPMC samples measured 1,907,069.64, 1,500,853.60, and 2,457,347.24 total_ops_per_sec; median 1,907,069.64 is below the required 2,190,294.
+
+### Feedback
+Failing criterion: improve the shared lock wait policy so the exact default MPMC benchmark median reaches at least 2,190,294 total_ops_per_sec. Current samples had a median of 1,907,069.64. Re-run the trusted four-scenario accuracy gate once a complete Go toolchain is available; the current environment is missing cmp and slices.
+
