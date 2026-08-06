@@ -5,6 +5,7 @@ mod ffi;
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
 use std::ops::{Deref, DerefMut};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -48,7 +49,7 @@ impl Slot {
         match &mut self.storage {
             SlotStorage::Inline { bytes, length } => {
                 debug_assert!(data.len() <= INLINE_VALUE_CAPACITY);
-                bytes[..data.len()].copy_from_slice(data);
+                copy_inline(bytes, data);
                 *length = data.len();
                 Ok(())
             }
@@ -71,12 +72,12 @@ impl Slot {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn copy_to(&self, output: &mut [u8]) {
         match &self.storage {
             SlotStorage::Inline { bytes, length } => {
                 debug_assert_eq!(*length, output.len());
-                output.copy_from_slice(&bytes[..*length]);
+                copy_inline(output, &bytes[..*length]);
             }
             SlotStorage::Heap(value) => {
                 debug_assert_eq!(value.len(), output.len());
@@ -85,11 +86,43 @@ impl Slot {
         }
     }
 
-    fn clear(&mut self) {
-        match &mut self.storage {
-            SlotStorage::Inline { length, .. } => *length = 0,
-            SlotStorage::Heap(value) => value.clear(),
+}
+
+#[inline(always)]
+fn copy_inline(destination: &mut [u8], source: &[u8]) {
+    debug_assert!(source.len() <= INLINE_VALUE_CAPACITY);
+    match source.len() {
+        0 => {}
+        1 => destination[0] = source[0],
+        2 => unsafe {
+            ptr::write_unaligned(destination.as_mut_ptr() as *mut u16,
+                ptr::read_unaligned(source.as_ptr() as *const u16));
+        },
+        3 => {
+            destination[..2].copy_from_slice(&source[..2]);
+            destination[2] = source[2];
         }
+        4 => unsafe {
+            ptr::write_unaligned(destination.as_mut_ptr() as *mut u32,
+                ptr::read_unaligned(source.as_ptr() as *const u32));
+        },
+        5 => {
+            destination[..4].copy_from_slice(&source[..4]);
+            destination[4] = source[4];
+        }
+        6 => {
+            destination[..4].copy_from_slice(&source[..4]);
+            destination[4..6].copy_from_slice(&source[4..6]);
+        }
+        7 => {
+            destination[..4].copy_from_slice(&source[..4]);
+            destination[4..7].copy_from_slice(&source[4..7]);
+        }
+        8 => unsafe {
+            ptr::write_unaligned(destination.as_mut_ptr() as *mut u64,
+                ptr::read_unaligned(source.as_ptr() as *const u64));
+        },
+        _ => unreachable!(),
     }
 }
 
@@ -182,23 +215,34 @@ impl SlotIndexHeap {
 
     #[inline]
     fn push(&mut self, entry: PublishedEntry) {
-        self.entries.push(entry);
-        let mut child = self.entries.len() - 1;
+        let mut child = self.entries.len();
+        debug_assert!(child < self.entries.capacity());
+        unsafe {
+            self.entries.as_mut_ptr().add(child).write(entry);
+            self.entries.set_len(child + 1);
+        }
         while child != 0 {
             let parent = (child - 1) / 2;
-            if !comes_before(self.entries[child], self.entries[parent]) {
+            if !comes_before(entry, self.entries[parent]) {
                 break;
             }
-            self.entries.swap(child, parent);
+            self.entries[child] = self.entries[parent];
             child = parent;
         }
+        self.entries[child] = entry;
     }
 
     #[inline]
     fn pop(&mut self) -> Option<PublishedEntry> {
-        let root = self.entries.first().copied()?;
-        let last = self.entries.pop().expect("heap root implies a last item");
-        if !self.entries.is_empty() {
+        let length = self.entries.len();
+        if length == 0 {
+            return None;
+        }
+        let root = unsafe { *self.entries.as_ptr() };
+        let last_index = length - 1;
+        let last = unsafe { *self.entries.as_ptr().add(last_index) };
+        unsafe { self.entries.set_len(last_index) };
+        if last_index != 0 {
             let mut hole = 0;
             loop {
                 let left = hole * 2 + 1;
@@ -235,8 +279,41 @@ struct ReservationState {
     free_slots: Vec<usize>,
 }
 
+impl ReservationState {
+    #[inline(always)]
+    fn take_free_slot(&mut self) -> Option<usize> {
+        let length = self.free_slots.len();
+        if length == 0 {
+            return None;
+        }
+        let slot_index = unsafe { *self.free_slots.as_ptr().add(length - 1) };
+        unsafe { self.free_slots.set_len(length - 1) };
+        Some(slot_index)
+    }
+
+    #[inline(always)]
+    fn return_free_slot(&mut self, slot_index: usize) {
+        let length = self.free_slots.len();
+        debug_assert!(length < self.free_slots.capacity());
+        unsafe {
+            self.free_slots.as_mut_ptr().add(length).write(slot_index);
+            self.free_slots.set_len(length + 1);
+        }
+    }
+}
+
 struct PublishedState {
     heap: SlotIndexHeap,
+}
+
+#[repr(align(64))]
+struct AvailabilityFlag(AtomicBool);
+
+impl AvailabilityFlag {
+    #[inline]
+    fn new(value: bool) -> Self {
+        Self(AtomicBool::new(value))
+    }
 }
 
 struct QueueState {
@@ -244,6 +321,9 @@ struct QueueState {
     slots: Vec<UnsafeCell<Slot>>,
     reservation: SpinMutex<ReservationState>,
     published: SpinMutex<PublishedState>,
+    // A false value is the lock-free fast path for the stable FULL state; the
+    // reservation stack remains authoritative for races that observe true.
+    has_free_slots: AvailabilityFlag,
 }
 
 // A slot is owned by exactly one phase at a time:
@@ -311,6 +391,7 @@ impl Queue {
                 published: SpinMutex::new(PublishedState {
                     heap: SlotIndexHeap::new(capacity)?,
                 }),
+                has_free_slots: AvailabilityFlag::new(true),
             }),
         })
     }
@@ -341,11 +422,29 @@ impl Producer {
         if data.len() > self.state.max_value_size {
             return STATUS_INVALID;
         }
+        if !self
+            .state
+            .has_free_slots
+            .0
+            .load(Ordering::SeqCst)
+        {
+            return STATUS_FULL;
+        }
         let slot_index = {
             let mut reservation = self.state.reservation.lock();
-            let Some(slot_index) = reservation.free_slots.pop() else {
+            let Some(slot_index) = reservation.take_free_slot() else {
+                self.state
+                    .has_free_slots
+                    .0
+                    .store(false, Ordering::SeqCst);
                 return STATUS_FULL;
             };
+            if reservation.free_slots.is_empty() {
+                self.state
+                    .has_free_slots
+                    .0
+                    .store(false, Ordering::SeqCst);
+            }
             slot_index
         };
 
@@ -356,7 +455,13 @@ impl Producer {
             .is_err()
         {
             let mut reservation = self.state.reservation.lock();
-            reservation.free_slots.push(slot_index);
+            reservation.return_free_slot(slot_index);
+            if reservation.free_slots.len() == 1 {
+                self.state
+                    .has_free_slots
+                    .0
+                    .store(true, Ordering::SeqCst);
+            }
             return STATUS_INTERNAL_ERROR;
         }
         {
@@ -402,11 +507,17 @@ impl Consumer {
             slot.copy_to(&mut output[..length]);
         }
 
-        // The consumer still owns the slot while clearing it. Only then make
-        // it visible to a producer again.
-        unsafe { self.state.slot_mut(slot_index) }.clear();
+        // The consumer still owns the slot while recycling it. The next
+        // producer overwrites both payload bytes and length before publication,
+        // so no clearing pass is needed between those exclusive owners.
         let mut reservation = self.state.reservation.lock();
-        reservation.free_slots.push(slot_index);
+        reservation.return_free_slot(slot_index);
+        if reservation.free_slots.len() == 1 {
+            self.state
+                .has_free_slots
+                .0
+                .store(true, Ordering::SeqCst);
+        }
         Ok(length)
     }
 }
@@ -468,8 +579,6 @@ mod tests {
                 let mut output = vec![0_u8; length];
                 slot.copy_to(&mut output);
                 assert_eq!(output, input);
-                slot.clear();
-                assert_eq!(slot.len(), 0);
             }
         }
     }
@@ -485,7 +594,6 @@ mod tests {
             SlotStorage::Inline { .. } => unreachable!(),
         };
         assert!(capacity >= 9);
-        slot.clear();
         slot.copy_value(&[0x22; 7]).unwrap();
         assert_eq!(slot.len(), 7);
         let mut output = [0_u8; 7];
