@@ -352,3 +352,12 @@ The candidate exports the required ABI and continues to return the lowest-priori
 ### Summary
 Implemented a preallocated fixed-arity 4-way PublishedEntry min-heap in src/lib.rs with exact ordering and allocation-free push/pop. Tests, ABI checks, probes, and accuracy gates pass; local benchmark median was 1,858,090 ops/s, below target.
 
+## Round 4 — Judge (attempt 3)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully, exports all required ABI symbols, and the six Rust tests pass, including priority ordering, entry conservation, and allocation-free heap operations. Native probes pass for inline, non-word-aligned, and 1 MiB values; the recorded trusted accuracy gate also passes all scenarios. Source inspection finds no benchmark-specific shortcut. However, the current official 4P/4C MPMC benchmark reports samples of 1,864,333, 1,682,035, and 1,858,090 total_ops_per_sec, for a median of 1,858,090, below the required 2,190,294. An independent native rerun was similarly noisy and below the threshold at a 1,863,852 median. The fixed-arity heap optimization therefore fails the headline performance criterion.
+
+### Feedback
+Improve or revert the publication-path optimization until the exact three-repetition 4P/4C MPMC median strictly exceeds 2,190,294 total_ops_per_sec. Focus on publication-lock contention, heap sift-down/child-selection cost, and scheduling-sensitive synchronization overhead. Note that the previously recorded 2,190,293.56 also does not strictly exceed the stated threshold.
+
