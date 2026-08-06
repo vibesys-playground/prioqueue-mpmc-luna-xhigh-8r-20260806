@@ -68,8 +68,8 @@ acceptance"); read it before parking or abandoning.
 
 ## Major
 
-- **M1 — `in_progress` (round 1): Preallocated reusable item slots and heap indices.** Replace per-enqueue `Vec` allocation and heap-owned `Entry` movement with a bounded slot pool whose value buffers are reused; this removes allocator work and reduces the current global-lock hot path.
-- **M2 — `todo`: Reduce MPMC serialization in priority publication/removal.** Introduce a correctness-preserving concurrent or fine-grained priority-index design so four producers and four consumers do not all serialize on one mutex; this is the largest expected throughput lever after storage overhead is removed.
+- **M1 — `done` (round 1): Preallocated reusable item slots and heap indices.** The bounded slot pool, reusable value buffers, free-slot stack, and slot-index heap removed per-enqueue heap-object allocation; the trusted MPMC benchmark improved from the naive baseline to 843,086 total ops/s.
+- **M2 — `in_progress` (round 2): Reduce MPMC serialization in priority publication/removal.** Split capacity reservation/recycling from published-heap access, and keep payload copying out of the shared publication lock, so four producers and four consumers do not all serialize on one mutex while preserving the exact minimum-priority contract.
 - **M3 — `todo`: Specialize the measured value-size path.** Keep copying semantics for every configured size while making small fixed-size values use compact inline/direct storage and making large values avoid unnecessary initialization or reallocations; this targets the benchmark's end-to-end copy cost.
 - **M4 — `todo`: Benchmark-driven queue-mode specialization.** Use the trusted producer/consumer counts and capacity to select cheaper SPSC/MPSC/SPMC paths where permitted, while retaining the exact minimum-priority and reservation-aware MPMC contract; this targets avoidable synchronization in non-MPMC checks and provides comparison data for M2.
 

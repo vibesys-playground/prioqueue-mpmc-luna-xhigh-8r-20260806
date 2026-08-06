@@ -76,3 +76,33 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 2 — Orchestrator (pre-round)
+- **need_profile**: False
+- **profile_focus**: 
+- **reasoning**: The latest round passed and improved throughput, while code inspection clearly identifies the single Mutex around all enqueue/dequeue operations as the next contention bottleneck. A profiling pass is unnecessary before planning the next synchronization-focused optimization.
+
+## Round 2 plan
+
+{"task":"Implement Major M2's first synchronization slice in src/lib.rs: replace the single QueueState.values mutex with separate short-held reservation/free-slot and published-min-heap state. A successful enqueue must reserve a slot under the free-slot lock, copy the borrowed value into exclusively owned slot storage without holding a queue-wide lock, then publish the slot's priority/index under the publication lock. A dequeue must inspect the published minimum and reject undersized output without mutation, remove a valid item, copy from its exclusively owned slot without holding the publication lock, and recycle the slot only after the copy. Use safe synchronization (per-slot ownership/locking or an equivalent sound design) so metadata and value storage have no data races; preserve reservation-aware FULL, publication-only EMPTY, exact minimum-priority behavior, try-style progress, and all existing C ABI semantics. Do not add benchmark-specific shortcuts.","pass_criteria":"The candidate builds ./priority-queue-candidate.so and the trusted accuracy gate passes all scenarios, including MPMC reservation-aware FULL/EMPTY behavior, minimum-priority dequeue, copied ownership, undersized-output retention, and conservation. Source inspection confirms no single mutex guards both payload copying and the shared publication heap; the benchmark reports a valid end-to-end MPMC total_ops_per_sec and improves on the round-1 median of 843086 ops/s without regressing correctness.","revert_to_round":null,"reasoning":"Round 1 removed allocation and raised MPMC throughput to 843,086 ops/s, but every operation still holds one mutex across slot access, heap maintenance, and the payload copy. Splitting reservation from publication and moving copying onto privately owned slots attacks that concrete serialization mechanism while keeping the exact priority heap for correctness."}
+## Round 2 — Orchestrator (plan)
+- **reasoning**: Reusable storage raised throughput to 843,086 ops/s, but one mutex still serializes heap access, slot management, and payload copies. Separating reservation, publication, and slot ownership targets that concrete bottleneck while retaining the exact priority heap.
+
+### Task
+Implement Major M2's first synchronization slice in src/lib.rs: replace the single QueueState.values mutex with separate short-held reservation/free-slot and published-min-heap state. Enqueue must reserve a slot, copy the borrowed value without holding a queue-wide lock, then publish the priority/index. Dequeue must preserve undersized-output behavior, remove the published minimum, copy from exclusively owned storage without holding the publication lock, and recycle afterward. Use sound synchronization and preserve FULL/EMPTY, priority, ABI, ownership, and try-style semantics. Do not add benchmark-specific shortcuts.
+
+### Pass criteria
+The candidate builds ./priority-queue-candidate.so and passes all trusted accuracy scenarios, including MPMC reservation-aware behavior, priority ordering, ownership, bounds, and conservation. No single mutex may cover both payload copying and publication-heap access. The benchmark reports valid MPMC total_ops_per_sec above the round-1 median of 843086 without correctness regressions.
+
+## Round 2 — Implementer
+
+### Summary
+Replaced the single `values` mutex with independent reservation/free-slot and published-heap mutexes. Producers reserve a slot, copy the borrowed value into exclusively owned storage, set priority metadata, and publish the slot index. Consumers validate the published minimum's output length, remove it, copy after releasing the publication lock, then clear and recycle the slot. Slot ownership transitions are documented and enforced with `UnsafeCell` plus the two state-lock protocols, preserving reservation-aware `FULL`, publication-only `EMPTY`, minimum-priority ordering, copied ownership, and try-style ABI behavior.
+
+### Validation
+`cargo test --locked`, `make`, exported-symbol inspection, native ABI probes for capacities 1/3/7/64 and value sizes 8/257/1 MiB, and native SPSC/MPSC/SPMC/MPMC benchmark runs passed. Three 1-second native MPMC runs reported 1,000,649, 1,307,073, and 801,636 total ops/sec (median 1,000,649), above the round-1 median of 843,086. The Go accuracy command remains unavailable because the installed Go binary has no usable GOROOT.
+## Round 2 — Implementer (attempt 1)
+- **expected_behavior**: The queue preserves reservation-aware FULL/EMPTY semantics, minimum-priority dequeue, copied ownership, bounds behavior, ABI compatibility, and safe MPMC conservation.
+
+### Summary
+Implemented M2 synchronization split with separate reservation/free-slot and published-heap mutexes, exclusive slot ownership, and payload copying outside shared locks. Built and validated the candidate with native probes and benchmarks; median MPMC throughput was 1,000,649 ops/sec.
+

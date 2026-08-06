@@ -2,6 +2,7 @@
 
 mod ffi;
 
+use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex};
 
 const ABI_VERSION: u32 = 1;
@@ -53,12 +54,12 @@ impl SlotIndexHeap {
         self.indices.first().copied()
     }
 
-    fn push(&mut self, index: usize, slots: &[Slot]) {
+    unsafe fn push(&mut self, index: usize, slots: &[UnsafeCell<Slot>]) {
         self.indices.push(index);
         let mut child = self.indices.len() - 1;
         while child != 0 {
             let parent = (child - 1) / 2;
-            if !comes_before(self.indices[child], self.indices[parent], slots) {
+            if !unsafe { comes_before(self.indices[child], self.indices[parent], slots) } {
                 break;
             }
             self.indices.swap(child, parent);
@@ -66,7 +67,7 @@ impl SlotIndexHeap {
         }
     }
 
-    fn pop(&mut self, slots: &[Slot]) -> Option<usize> {
+    unsafe fn pop(&mut self, slots: &[UnsafeCell<Slot>]) -> Option<usize> {
         let root = self.indices.first().copied()?;
         let last = self.indices.pop().expect("heap root implies a last item");
         if !self.indices.is_empty() {
@@ -80,11 +81,11 @@ impl SlotIndexHeap {
                 let right = left + 1;
                 let mut child = left;
                 if right < self.indices.len()
-                    && comes_before(self.indices[right], self.indices[left], slots)
+                    && unsafe { comes_before(self.indices[right], self.indices[left], slots) }
                 {
                     child = right;
                 }
-                if !comes_before(self.indices[child], self.indices[parent], slots) {
+                if !unsafe { comes_before(self.indices[child], self.indices[parent], slots) } {
                     break;
                 }
                 self.indices.swap(parent, child);
@@ -95,33 +96,48 @@ impl SlotIndexHeap {
     }
 }
 
-fn comes_before(left: usize, right: usize, slots: &[Slot]) -> bool {
-    let left = &slots[left];
-    let right = &slots[right];
+unsafe fn comes_before(left: usize, right: usize, slots: &[UnsafeCell<Slot>]) -> bool {
+    let left = unsafe { &*slots[left].get() };
+    let right = unsafe { &*slots[right].get() };
     left.priority < right.priority
         || (left.priority == right.priority && left.sequence < right.sequence)
 }
 
-struct Values {
+struct ReservationState {
     next_sequence: u64,
-    slots: Vec<Slot>,
     free_slots: Vec<usize>,
-    heap: SlotIndexHeap,
 }
 
-impl Values {
-    fn publish(&mut self, slot_index: usize) {
-        self.heap.push(slot_index, &self.slots);
-    }
-
-    fn remove_min(&mut self) -> Option<usize> {
-        self.heap.pop(&self.slots)
-    }
+struct PublishedState {
+    heap: SlotIndexHeap,
 }
 
 struct QueueState {
     max_value_size: usize,
-    values: Mutex<Values>,
+    slots: Vec<UnsafeCell<Slot>>,
+    reservation: Mutex<ReservationState>,
+    published: Mutex<PublishedState>,
+}
+
+// A slot is owned by exactly one phase at a time:
+//
+//   free-slot stack -> reserving producer -> publication heap -> removing consumer
+//   -> free-slot stack
+//
+// The reservation and publication mutexes protect those transitions. A producer
+// writes a reserved slot before publishing its index, and a consumer reads a
+// removed slot before recycling its index. Thus no two threads access a slot's
+// payload concurrently even though the payload itself is not mutex-protected.
+unsafe impl Sync for QueueState {}
+
+impl QueueState {
+    unsafe fn slot(&self, slot_index: usize) -> &Slot {
+        unsafe { &*self.slots[slot_index].get() }
+    }
+
+    unsafe fn slot_mut(&self, slot_index: usize) -> &mut Slot {
+        unsafe { &mut *self.slots[slot_index].get() }
+    }
 }
 
 pub struct Queue {
@@ -147,7 +163,7 @@ impl Queue {
             .try_reserve_exact(capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         for _ in 0..capacity {
-            slots.push(Slot::new());
+            slots.push(UnsafeCell::new(Slot::new()));
         }
 
         let mut free_slots = Vec::new();
@@ -163,10 +179,12 @@ impl Queue {
             consumer_count,
             state: Arc::new(QueueState {
                 max_value_size,
-                values: Mutex::new(Values {
+                slots,
+                reservation: Mutex::new(ReservationState {
                     next_sequence: 0,
-                    slots,
                     free_slots,
+                }),
+                published: Mutex::new(PublishedState {
                     heap: SlotIndexHeap::new(capacity)?,
                 }),
             }),
@@ -199,23 +217,47 @@ impl Producer {
         if data.len() > self.state.max_value_size {
             return STATUS_INVALID;
         }
-        let Ok(mut values) = self.state.values.lock() else {
-            return STATUS_INTERNAL_ERROR;
-        };
-        let Some(slot_index) = values.free_slots.pop() else {
-            return STATUS_FULL;
+        let (slot_index, sequence) = {
+            let Ok(mut reservation) = self.state.reservation.lock() else {
+                return STATUS_INTERNAL_ERROR;
+            };
+            let Some(slot_index) = reservation.free_slots.pop() else {
+                return STATUS_FULL;
+            };
+            let sequence = reservation.next_sequence;
+            reservation.next_sequence = reservation.next_sequence.wrapping_add(1);
+            (slot_index, sequence)
         };
 
-        let sequence = values.next_sequence;
-        let slot = &mut values.slots[slot_index];
-        if slot.copy_value(data).is_err() {
-            values.free_slots.push(slot_index);
+        // The reservation gives this producer exclusive access to the slot.
+        // Keep the borrowed input copy independent from both shared queue locks.
+        if unsafe { self.state.slot_mut(slot_index) }
+            .copy_value(data)
+            .is_err()
+        {
+            let Ok(mut reservation) = self.state.reservation.lock() else {
+                return STATUS_INTERNAL_ERROR;
+            };
+            reservation.free_slots.push(slot_index);
             return STATUS_INTERNAL_ERROR;
         }
-        slot.priority = priority;
-        slot.sequence = sequence;
-        values.next_sequence = values.next_sequence.wrapping_add(1);
-        values.publish(slot_index);
+        {
+            let slot = unsafe { self.state.slot_mut(slot_index) };
+            slot.priority = priority;
+            slot.sequence = sequence;
+        }
+
+        let Ok(mut published) = self.state.published.lock() else {
+            let Ok(mut reservation) = self.state.reservation.lock() else {
+                return STATUS_INTERNAL_ERROR;
+            };
+            reservation.free_slots.push(slot_index);
+            return STATUS_INTERNAL_ERROR;
+        };
+
+        // Publication is short-held and only touches heap/index metadata. The
+        // payload was fully copied before this lock was acquired.
+        unsafe { published.heap.push(slot_index, &self.state.slots) };
         STATUS_OK
     }
 }
@@ -226,23 +268,36 @@ pub struct Consumer {
 
 impl Consumer {
     fn try_dequeue(&self, output: &mut [u8]) -> Result<usize, u32> {
-        let Ok(mut values) = self.state.values.lock() else {
+        let (slot_index, length) = {
+            let Ok(mut published) = self.state.published.lock() else {
+                return Err(STATUS_INTERNAL_ERROR);
+            };
+            let Some(slot_index) = published.heap.peek() else {
+                return Err(STATUS_EMPTY);
+            };
+            let length = unsafe { self.state.slot(slot_index) }.value.len();
+            if length > output.len() {
+                return Err(STATUS_INVALID);
+            }
+            // Removing the index transfers exclusive slot ownership to this
+            // consumer. Do not hold publication while copying the payload.
+            let slot_index = unsafe { published.heap.pop(&self.state.slots) }
+                .expect("heap peek implies a heap item");
+            (slot_index, length)
+        };
+
+        {
+            let slot = unsafe { self.state.slot(slot_index) };
+            output[..length].copy_from_slice(&slot.value);
+        }
+
+        // The consumer still owns the slot while clearing it. Only then make
+        // it visible to a producer again.
+        unsafe { self.state.slot_mut(slot_index) }.value.clear();
+        let Ok(mut reservation) = self.state.reservation.lock() else {
             return Err(STATUS_INTERNAL_ERROR);
         };
-        let Some(slot_index) = values.heap.peek() else {
-            return Err(STATUS_EMPTY);
-        };
-        let slot = &values.slots[slot_index];
-        if slot.value.len() > output.len() {
-            return Err(STATUS_INVALID);
-        }
-        let length = slot.value.len();
-        output[..length].copy_from_slice(&slot.value);
-        let slot_index = values
-            .remove_min()
-            .expect("heap peek implies a heap item");
-        values.slots[slot_index].value.clear();
-        values.free_slots.push(slot_index);
+        reservation.free_slots.push(slot_index);
         Ok(length)
     }
 }
