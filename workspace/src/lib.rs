@@ -160,6 +160,8 @@ struct SlotIndexHeap {
     entries: Vec<PublishedEntry>,
 }
 
+const HEAP_ARITY: usize = 4;
+
 #[derive(Clone, Copy)]
 struct PublishedEntry {
     priority: u64,
@@ -182,16 +184,18 @@ impl SlotIndexHeap {
 
     #[inline]
     fn push(&mut self, entry: PublishedEntry) {
+        debug_assert!(self.entries.len() < self.entries.capacity());
         self.entries.push(entry);
         let mut child = self.entries.len() - 1;
         while child != 0 {
-            let parent = (child - 1) / 2;
-            if !comes_before(self.entries[child], self.entries[parent]) {
+            let parent = (child - 1) / HEAP_ARITY;
+            if !comes_before(entry, self.entries[parent]) {
                 break;
             }
-            self.entries.swap(child, parent);
+            self.entries[child] = self.entries[parent];
             child = parent;
         }
+        self.entries[child] = entry;
     }
 
     #[inline]
@@ -199,26 +203,39 @@ impl SlotIndexHeap {
         let root = self.entries.first().copied()?;
         let last = self.entries.pop().expect("heap root implies a last item");
         if !self.entries.is_empty() {
-            self.entries[0] = last;
             let mut parent = 0;
             loop {
-                let left = parent * 2 + 1;
-                if left >= self.entries.len() {
+                let first_child = parent * HEAP_ARITY + 1;
+                if first_child >= self.entries.len() {
                     break;
                 }
-                let right = left + 1;
-                let mut child = left;
-                if right < self.entries.len()
-                    && comes_before(self.entries[right], self.entries[left])
+                let mut child = first_child;
+                let length = self.entries.len();
+                let second_child = first_child + 1;
+                if second_child < length
+                    && comes_before(self.entries[second_child], self.entries[child])
                 {
-                    child = right;
+                    child = second_child;
                 }
-                if !comes_before(self.entries[child], self.entries[parent]) {
+                let third_child = first_child + 2;
+                if third_child < length
+                    && comes_before(self.entries[third_child], self.entries[child])
+                {
+                    child = third_child;
+                }
+                let fourth_child = first_child + 3;
+                if fourth_child < length
+                    && comes_before(self.entries[fourth_child], self.entries[child])
+                {
+                    child = fourth_child;
+                }
+                if !comes_before(self.entries[child], last) {
                     break;
                 }
-                self.entries.swap(parent, child);
+                self.entries[parent] = self.entries[child];
                 parent = child;
             }
+            self.entries[parent] = last;
         }
         Some(root)
     }
@@ -490,5 +507,154 @@ mod tests {
         let mut output = [0_u8; 7];
         slot.copy_to(&mut output);
         assert_eq!(output, [0x22; 7]);
+    }
+
+    #[test]
+    fn four_way_heap_preserves_entry_order_and_capacity() {
+        let mut heap = SlotIndexHeap::new(16).unwrap();
+        let initial_capacity = heap.entries.capacity();
+        let entries = [
+            PublishedEntry {
+                priority: 9,
+                slot_index: 14,
+            },
+            PublishedEntry {
+                priority: 1,
+                slot_index: 11,
+            },
+            PublishedEntry {
+                priority: 4,
+                slot_index: 3,
+            },
+            PublishedEntry {
+                priority: 1,
+                slot_index: 2,
+            },
+            PublishedEntry {
+                priority: 7,
+                slot_index: 8,
+            },
+            PublishedEntry {
+                priority: 1,
+                slot_index: 7,
+            },
+            PublishedEntry {
+                priority: 4,
+                slot_index: 1,
+            },
+            PublishedEntry {
+                priority: 0,
+                slot_index: 15,
+            },
+            PublishedEntry {
+                priority: 12,
+                slot_index: 0,
+            },
+            PublishedEntry {
+                priority: 4,
+                slot_index: 12,
+            },
+            PublishedEntry {
+                priority: 2,
+                slot_index: 6,
+            },
+            PublishedEntry {
+                priority: 2,
+                slot_index: 5,
+            },
+            PublishedEntry {
+                priority: 8,
+                slot_index: 10,
+            },
+            PublishedEntry {
+                priority: 3,
+                slot_index: 4,
+            },
+            PublishedEntry {
+                priority: 6,
+                slot_index: 9,
+            },
+            PublishedEntry {
+                priority: 5,
+                slot_index: 13,
+            },
+        ];
+        for entry in entries {
+            heap.push(entry);
+            assert_eq!(heap.entries.capacity(), initial_capacity);
+        }
+
+        for expected in [
+            PublishedEntry {
+                priority: 0,
+                slot_index: 15,
+            },
+            PublishedEntry {
+                priority: 1,
+                slot_index: 2,
+            },
+            PublishedEntry {
+                priority: 1,
+                slot_index: 7,
+            },
+            PublishedEntry {
+                priority: 1,
+                slot_index: 11,
+            },
+            PublishedEntry {
+                priority: 2,
+                slot_index: 5,
+            },
+            PublishedEntry {
+                priority: 2,
+                slot_index: 6,
+            },
+            PublishedEntry {
+                priority: 3,
+                slot_index: 4,
+            },
+            PublishedEntry {
+                priority: 4,
+                slot_index: 1,
+            },
+            PublishedEntry {
+                priority: 4,
+                slot_index: 3,
+            },
+            PublishedEntry {
+                priority: 4,
+                slot_index: 12,
+            },
+            PublishedEntry {
+                priority: 5,
+                slot_index: 13,
+            },
+            PublishedEntry {
+                priority: 6,
+                slot_index: 9,
+            },
+            PublishedEntry {
+                priority: 7,
+                slot_index: 8,
+            },
+            PublishedEntry {
+                priority: 8,
+                slot_index: 10,
+            },
+            PublishedEntry {
+                priority: 9,
+                slot_index: 14,
+            },
+            PublishedEntry {
+                priority: 12,
+                slot_index: 0,
+            },
+        ] {
+            let actual = heap.pop().expect("entry conservation");
+            assert_eq!(actual.priority, expected.priority);
+            assert_eq!(actual.slot_index, expected.slot_index);
+            assert_eq!(heap.entries.capacity(), initial_capacity);
+        }
+        assert!(heap.pop().is_none());
     }
 }

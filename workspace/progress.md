@@ -268,3 +268,35 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 4 — Orchestrator (pre-round)
+- **need_profile**: True
+- **profile_focus**: Measure 4P/4C MPMC time in publication spinlock and heap push/pop, reservation locking, slot copies, and FFI overhead.
+- **reasoning**: The latest round improved throughput substantially, but no recent profile identifies the dominant remaining cost. Several plausible bottlenecks remain, so measurement should guide the next synchronization or heap optimization.
+
+## Round 4 — Orchestrator (plan)
+
+{"task":"Implement Major M5's first slice in src/lib.rs only: replace the internal binary SlotIndexHeap used by the published-priority path with a fixed-arity 4-way min-heap over PublishedEntry, using the existing exact (priority, slot_index) comparator. Implement push and pop with the 4-way parent/child index arithmetic, choose the minimum among up to four children during sift-down, keep capacity preallocation and zero per-operation allocation, and preserve the current reservation/publication spinlock and slot-ownership protocol. Do not change the C ABI, reservation-aware FULL/EMPTY semantics, payload storage, or add benchmark-specific branches.","pass_criteria":"The candidate still builds ./priority-queue-candidate.so with the required copying ABI and the trusted accuracy gate passes all scenarios. Source inspection and focused Rust tests confirm the publication heap is a correct fixed-arity exact-priority min-heap: arbitrary priorities dequeue in lowest numeric order, equal priorities remain valid, push/pop preserve all entries, and heap operations do not grow or allocate after construction. The official default 4P/4C MPMC benchmark reports a valid end-to-end total_ops_per_sec median above the round-3 reference of 2,190,294, with no benchmark-specific shortcut in src/lib.rs or implementer-added modules.","revert_to_round":null,"reasoning":"M3 is done and raised the trusted MPMC median to 2,190,294 ops/s. M4 is abandoned because its non-MPMC branches would be unreachable in the scored 4P/4C queue creation path. The remaining broadly applicable publication hot path is binary-heap maintenance under the publication spinlock; a preallocated 4-way heap reduces sift depth and keeps exact minimum-priority behavior without changing synchronization or ownership semantics."}
+## Round 4 — Orchestrator (plan)
+- **reasoning**: M3 raised the trusted MPMC median to 2,190,294 ops/s. M4 is abandoned because non-MPMC mode branches cannot execute in the scored 4P/4C path. A preallocated 4-way heap targets binary-heap maintenance under the remaining publication spinlock without changing correctness-critical protocols.
+
+### Task
+Implement Major M5's first slice in src/lib.rs only: replace the internal binary SlotIndexHeap with a fixed-arity 4-way min-heap over PublishedEntry, preserving exact (priority, slot_index) ordering, preallocation, zero per-operation allocation, and the existing synchronization, ABI, capacity, and ownership semantics.
+
+### Pass criteria
+The candidate builds ./priority-queue-candidate.so, passes the trusted accuracy gate, and focused tests verify exact priority ordering, entry conservation, and allocation-free heap push/pop. The official 4P/4C MPMC benchmark median exceeds 2,190,294 total_ops_per_sec with no benchmark-specific shortcut.
+
+## Round 4 — Implementer
+
+### Summary
+
+Replaced the publication path's binary `SlotIndexHeap` sift logic with a fixed-arity 4-way min-heap over the existing preallocated `PublishedEntry` vector. Push uses 4-way parent arithmetic and hole-style upward movement; pop selects the minimum among up to four children and sifts downward against the saved last entry. The exact `(priority, slot_index)` comparator, reservation/publication spinlocks, slot ownership, ABI, capacity semantics, and payload storage are unchanged. Heap tests assert exact priority/tie ordering, entry conservation, and stable backing capacity through a full push/pop cycle.
+
+### Validation
+
+`cargo test --locked`, `cargo test --release --locked`, and `make` passed, producing `priority-queue-candidate.so` with all required ABI symbols. The trusted native runner probes passed for max value sizes 8, 257, and 1 MiB, including copied-input ownership, bounds/retention, concurrent undersized dequeue, and conservation behavior. The Go accuracy/benchmark wrapper could not run because the installed Go binary has no usable GOROOT. Direct native MPMC benchmark runs completed with valid conservation at 1,502,651, 2,032,145, 1,977,398, and 1,941,798 successful ops/sec; local results were noisy and below the round-3 framework median.
+## Round 4 — Implementer (attempt 1)
+- **expected_behavior**: The queue preserves ABI, ownership, capacity, synchronization, exact priority ordering, entry conservation, and allocation-free heap push/pop behavior.
+
+### Summary
+Replaced the binary SlotIndexHeap with a preallocated fixed-arity 4-way PublishedEntry min-heap, preserving exact ordering and zero per-operation allocation. Rust tests, release build, native probes, and ABI checks passed.
+
