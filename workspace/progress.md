@@ -283,3 +283,12 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 ### Summary
 Implemented M6 hole-style minimum removal in src/lib.rs while preserving the round-3 heap, comparator, locks, capacity, and slot storage. Tests, build, probes, and ABI checks pass.
 
+## Round 5 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The library builds successfully as ./priority-queue-candidate.so and exports the required ABI. Rust tests, evaluator tests, ABI profiles, and 100-trial SPSC/MPSC/SPMC/MPMC accuracy checks all pass. The preallocated slot-index binary heap preserves priority ordering and entry conservation. However, the exact default 4P/4C three-repetition benchmark produced samples of 1,423,130, 1,834,992, and 1,447,559 total_ops_per_sec, with a median of 1,447,559—below the required 2,190,294 threshold.
+
+### Feedback
+Optimize the MPMC hot path, especially the globally serialized publication heap and reservation/recycling spin locks, while retaining exact minimum-priority behavior and reservation-aware semantics. Re-run the exact three-repetition benchmark and exceed 2,190,294 total_ops_per_sec.
+
