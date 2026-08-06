@@ -407,3 +407,14 @@ The candidate builds successfully as ./priority-queue-candidate.so and exports t
 ### Feedback
 Improve unpinned default 4P/4C MPMC throughput so the exact three-repetition median exceeds 2,190,294 total_ops_per_sec. The globally serialized publication heap and reservation/recycling spin locks remain the likely bottlenecks. Re-run the exact evaluator command, and restore a usable Go GOROOT to verify the complete trusted accuracy gate.
 
+## Round 6 — Implementer (M5, current)
+
+Rewrote `SlotIndexHeap::push` in `src/lib.rs` as an always-inlined raw-pointer sift-up. It uses shift-based `(child - 1) >> 1` parent arithmetic, expands the unchanged `(priority, slot_index)` `comes_before` ordering to avoid loading the tie-break field after a priority mismatch, shifts parent entries in place, and writes the incoming `PublishedEntry` once at its final position. Heap capacity, locks, reservation/recycling, dequeue removal, slot storage, ABI, and concurrency behavior were not changed.
+
+Validation: debug/release Rust tests, `make`, required ABI symbol checks, evaluator Go tests, and the complete 100-trial SPSC/MPSC/SPMC/MPMC accuracy gate passed using a temporary complete Go 1.22.5 GOROOT. The exact evaluator benchmark command ran successfully; under this host's heavy scheduler load its three samples were 1,773,077, 1,639,771, and 1,408,534 total ops/sec (median 1,639,771). A short native sample reached 2,211,901 total ops/sec, but the exact three-repetition median did not clear 2,190,294.
+## Round 6 — Implementer (attempt 3)
+- **expected_behavior**: Preserves allocation-free heap insertion, priority/tie ordering, capacity, locks, recycling, dequeue, storage, ABI, and concurrency semantics.
+
+### Summary
+Rewrote SlotIndexHeap::push with raw-pointer sift-up, shift-based parent arithmetic, and one final entry write. Builds, tests, ABI checks, and full accuracy gate pass.
+

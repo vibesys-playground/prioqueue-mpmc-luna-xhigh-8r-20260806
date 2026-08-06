@@ -215,21 +215,31 @@ impl SlotIndexHeap {
 
     #[inline(always)]
     fn push(&mut self, entry: PublishedEntry) {
-        let final_length = self.entries.len() + 1;
-        debug_assert!(final_length <= self.entries.capacity());
+        let mut child = self.entries.len();
+        let final_length = child + 1;
+        debug_assert!(child < self.entries.capacity());
         let entries = self.entries.as_mut_ptr();
-        let mut child = final_length - 1;
-        while child != 0 {
-            let parent = (child - 1) >> 1;
-            let parent_entry = unsafe { ptr::read(entries.add(parent)) };
-            if !comes_before(entry, parent_entry) {
-                break;
-            }
-            unsafe { ptr::write(entries.add(child), parent_entry) };
-            child = parent;
-        }
         unsafe {
-            ptr::write(entries.add(child), entry);
+            while child != 0 {
+                let parent = (child - 1) >> 1;
+                let parent_entry = entries.add(parent);
+                let parent_priority = (*parent_entry).priority;
+                // This is the exact comes_before ordering, expanded so a
+                // priority mismatch does not load the tie-break field.
+                if entry.priority > parent_priority {
+                    break;
+                }
+                let parent_slot_index = (*parent_entry).slot_index;
+                if entry.priority == parent_priority && entry.slot_index >= parent_slot_index {
+                    break;
+                }
+                entries.add(child).write(PublishedEntry {
+                    priority: parent_priority,
+                    slot_index: parent_slot_index,
+                });
+                child = parent;
+            }
+            entries.add(child).write(entry);
             self.entries.set_len(final_length);
         }
     }
