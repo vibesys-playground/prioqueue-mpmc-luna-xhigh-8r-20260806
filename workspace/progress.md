@@ -418,3 +418,12 @@ Validation: debug/release Rust tests, `make`, required ABI symbol checks, evalua
 ### Summary
 Rewrote SlotIndexHeap::push with raw-pointer sift-up, shift-based parent arithmetic, and one final entry write. Builds, tests, ABI checks, and full accuracy gate pass.
 
+## Round 6 — Judge (attempt 3)
+- **verdict**: fail
+
+### Analysis
+The candidate builds the required shared library and exports all ABI symbols. Release Rust tests pass (5/5), source inspection confirms allocation-free preallocated heap push, inline storage for sizes <=8, lazy reusable storage above 8, and correct priority/tie handling. All 20 native ABI probes across capacities 1/3/7/64 and value sizes 8/9/17/257/1MiB pass. The exact unpinned native MPMC benchmark parameters produced 1,459,007.97, 1,559,570.85, and 2,569,212.99 ops/sec; the median was 1,559,570.85, below the required strict threshold of 2,190,294. The Go accuracy wrapper could not run because the environment lacks a usable standard library, though no correctness regression was found in native probes.
+
+### Feedback
+Improve unpinned default 4P/4C MPMC throughput so the exact three-repetition evaluator median exceeds 2,190,294 total_ops_per_sec. Validate with the evaluator's exact command and do not rely on CPU-pinned results. The current benchmark median is 1,559,570.85, so the performance criterion fails.
+
