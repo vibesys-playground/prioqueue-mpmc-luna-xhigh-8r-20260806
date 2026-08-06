@@ -331,3 +331,12 @@ Implemented Major M6 in `src/lib.rs` from the round-3 queue design. Binary minim
 ### Summary
 Implemented M6 hole-style heap removal in src/lib.rs while preserving the round-3 heap, comparator, locks, storage, ABI, and queue semantics. Tests, build, ABI checks, and native probes passed; pinned benchmark median was 4.65M ops/s.
 
+## Round 5 — Judge (attempt 3)
+- **verdict**: fail
+
+### Analysis
+The candidate builds priority-queue-candidate.so and exports all required ABI symbols. Rust debug/release tests passed, and native probes passed for SPSC, MPSC, SPMC, and MPMC configurations, including ownership, bounds, retention, ordering, and conservation. The preallocated slot-index heap uses exact priority ordering and performs no heap growth during push/pop. The Go accuracy gate could not run because the installed Go standard library is missing cmp/slices; no correctness defect was observed in native probes or source inspection. The exact native benchmark configuration produced 2,050,761, 1,835,761, and 1,708,054 total_ops_per_sec, with a median of 1,835,761, below the strict 2,190,294 threshold.
+
+### Feedback
+Improve unpinned default 4P/4C MPMC throughput so the trusted three-repetition median strictly exceeds 2,190,294 total_ops_per_sec. Validate using the evaluator's exact benchmark command; CPU-pinned results alone do not satisfy this criterion.
+
