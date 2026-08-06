@@ -15,24 +15,81 @@ const STATUS_EMPTY: u32 = 2;
 const STATUS_INVALID: u32 = 3;
 const STATUS_INTERNAL_ERROR: u32 = 4;
 
+const INLINE_VALUE_CAPACITY: usize = 8;
+
+enum SlotStorage {
+    Inline {
+        bytes: [u8; INLINE_VALUE_CAPACITY],
+        length: usize,
+    },
+    Heap(Vec<u8>),
+}
+
 struct Slot {
-    value: Vec<u8>,
+    storage: SlotStorage,
 }
 
 impl Slot {
-    fn new() -> Self {
-        Self {
-            value: Vec::new(),
-        }
+    fn new(max_value_size: usize) -> Self {
+        let storage = if max_value_size <= INLINE_VALUE_CAPACITY {
+            SlotStorage::Inline {
+                bytes: [0; INLINE_VALUE_CAPACITY],
+                length: 0,
+            }
+        } else {
+            // Keep the larger-value path lazy: the reusable Vec obtains its
+            // backing allocation only when a value is first copied into it.
+            SlotStorage::Heap(Vec::new())
+        };
+        Self { storage }
     }
 
     fn copy_value(&mut self, data: &[u8]) -> Result<(), ()> {
-        self.value.clear();
-        if self.value.capacity() < data.len() {
-            self.value.try_reserve_exact(data.len()).map_err(|_| ())?;
+        match &mut self.storage {
+            SlotStorage::Inline { bytes, length } => {
+                debug_assert!(data.len() <= INLINE_VALUE_CAPACITY);
+                bytes[..data.len()].copy_from_slice(data);
+                *length = data.len();
+                Ok(())
+            }
+            SlotStorage::Heap(value) => {
+                value.clear();
+                if value.capacity() < data.len() {
+                    value.try_reserve_exact(data.len()).map_err(|_| ())?;
+                }
+                value.extend_from_slice(data);
+                Ok(())
+            }
         }
-        self.value.extend_from_slice(data);
-        Ok(())
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match &self.storage {
+            SlotStorage::Inline { length, .. } => *length,
+            SlotStorage::Heap(value) => value.len(),
+        }
+    }
+
+    #[inline]
+    fn copy_to(&self, output: &mut [u8]) {
+        match &self.storage {
+            SlotStorage::Inline { bytes, length } => {
+                debug_assert_eq!(*length, output.len());
+                output.copy_from_slice(&bytes[..*length]);
+            }
+            SlotStorage::Heap(value) => {
+                debug_assert_eq!(value.len(), output.len());
+                output.copy_from_slice(value);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        match &mut self.storage {
+            SlotStorage::Inline { length, .. } => *length = 0,
+            SlotStorage::Heap(value) => value.clear(),
+        }
     }
 }
 
@@ -232,7 +289,7 @@ impl Queue {
             .try_reserve_exact(capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         for _ in 0..capacity {
-            slots.push(UnsafeCell::new(Slot::new()));
+            slots.push(UnsafeCell::new(Slot::new(max_value_size)));
         }
 
         let mut free_slots = Vec::new();
@@ -326,7 +383,7 @@ impl Consumer {
             let Some(entry) = published.heap.peek() else {
                 return Err(STATUS_EMPTY);
             };
-            let length = unsafe { self.state.slot(entry.slot_index) }.value.len();
+            let length = unsafe { self.state.slot(entry.slot_index) }.len();
             if length > output.len() {
                 return Err(STATUS_INVALID);
             }
@@ -341,12 +398,12 @@ impl Consumer {
 
         {
             let slot = unsafe { self.state.slot(slot_index) };
-            output[..length].copy_from_slice(&slot.value);
+            slot.copy_to(&mut output[..length]);
         }
 
         // The consumer still owns the slot while clearing it. Only then make
         // it visible to a producer again.
-        unsafe { self.state.slot_mut(slot_index) }.value.clear();
+        unsafe { self.state.slot_mut(slot_index) }.clear();
         let mut reservation = self.state.reservation.lock();
         reservation.free_slots.push(slot_index);
         Ok(length)
@@ -394,5 +451,44 @@ mod tests {
         assert_eq!(consumer.try_dequeue(&mut output), Ok(7));
         assert_eq!(&output[..7], &[0x11; 7]);
         assert_eq!(consumer.try_dequeue(&mut output), Ok(0));
+    }
+
+    #[test]
+    fn inline_slots_copy_every_supported_length() {
+        for max_value_size in 1..=INLINE_VALUE_CAPACITY {
+            let mut slot = Slot::new(max_value_size);
+            assert!(matches!(slot.storage, SlotStorage::Inline { .. }));
+
+            for length in 0..=max_value_size {
+                let input = vec![length as u8; length];
+                slot.copy_value(&input).unwrap();
+                assert_eq!(slot.len(), length);
+
+                let mut output = vec![0_u8; length];
+                slot.copy_to(&mut output);
+                assert_eq!(output, input);
+                slot.clear();
+                assert_eq!(slot.len(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn heap_slots_start_lazy_and_reuse_storage() {
+        let mut slot = Slot::new(INLINE_VALUE_CAPACITY + 1);
+        assert!(matches!(&slot.storage, SlotStorage::Heap(value) if value.capacity() == 0));
+
+        slot.copy_value(&[0x11; 9]).unwrap();
+        let capacity = match &slot.storage {
+            SlotStorage::Heap(value) => value.capacity(),
+            SlotStorage::Inline { .. } => unreachable!(),
+        };
+        assert!(capacity >= 9);
+        slot.clear();
+        slot.copy_value(&[0x22; 7]).unwrap();
+        assert_eq!(slot.len(), 7);
+        let mut output = [0_u8; 7];
+        slot.copy_to(&mut output);
+        assert_eq!(output, [0x22; 7]);
     }
 }

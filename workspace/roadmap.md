@@ -69,9 +69,10 @@ acceptance"); read it before parking or abandoning.
 ## Major
 
 - **M1 — `done` (round 1): Preallocated reusable item slots and heap indices.** The bounded slot pool, reusable value buffers, free-slot stack, and slot-index heap removed per-enqueue heap-object allocation; the trusted MPMC benchmark improved from the naive baseline to 843,086 total ops/s.
-- **M2 — `in_progress` (round 2): Reduce MPMC serialization in priority publication/removal.** Split capacity reservation/recycling from published-heap access, and keep payload copying out of the shared publication lock, so four producers and four consumers do not all serialize on one mutex while preserving the exact minimum-priority contract.
-- **M3 — `todo`: Specialize the measured value-size path.** Keep copying semantics for every configured size while making small fixed-size values use compact inline/direct storage and making large values avoid unnecessary initialization or reallocations; this targets the benchmark's end-to-end copy cost.
+- **M2 — `done` (rounds 2-3): Reduce MPMC serialization in priority publication/removal.** Split capacity reservation/recycling from published-heap access, use short-held cache-aligned spin locks, and keep payload copying out of shared locks; the official benchmark reached 1,653,069 total ops/s while all accuracy scenarios passed.
+- **M3 — `in_progress` (round 3): Specialize the measured value-size path.** Keep copying semantics for every configured size while making max-value sizes at or below 8 bytes use compact inline/direct storage and making larger values retain lazy reusable buffers; this targets the benchmark's end-to-end copy and Vec overhead.
 - **M4 — `todo`: Benchmark-driven queue-mode specialization.** Use the trusted producer/consumer counts and capacity to select cheaper SPSC/MPSC/SPMC paths where permitted, while retaining the exact minimum-priority and reservation-aware MPMC contract; this targets avoidable synchronization in non-MPMC checks and provides comparison data for M2.
+- **M5 — `todo`: Alternative exact-priority publication structures.** Evaluate a cache-efficient or sharded publication representation only if profiling shows binary-heap maintenance and its single publication lock remain dominant after M3; this is the next structural contention lever for the 4P/4C workload.
 
 ## Minor
 

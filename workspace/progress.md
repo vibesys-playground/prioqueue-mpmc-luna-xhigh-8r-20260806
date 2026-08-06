@@ -76,6 +76,10 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 3 plan
+
+{"task":"Implement Major M3 in src/lib.rs only: specialize slot storage for queues whose trusted max_value_size is at most 8 bytes with a per-slot inline [u8; 8] buffer and explicit length, so successful enqueue and dequeue copy directly without Vec growth/allocation or heap-buffer initialization in the measured fast path. Retain the lazy reusable Vec-backed path for larger configured value sizes and support every valid length from zero through max_value_size. Preserve the existing copying C ABI in src/ffi.rs, reservation-aware FULL/EMPTY behavior, minimum-priority dequeue, undersized-output retention, and slot ownership synchronization; do not add benchmark-specific payload or priority shortcuts.","pass_criteria":"The candidate builds ./priority-queue-candidate.so and the trusted accuracy gate remains fully passing. Source inspection and targeted probes confirm that max_value_size <= 8 uses inline per-slot storage for lengths 0 through 8, with no per-operation Vec allocation or growth on that path, while configurations above 8 retain correct lazy reusable storage for arbitrary supported lengths including non-word-aligned and large values. The official default MPMC benchmark reports a valid end-to-end total_ops_per_sec median above the current 1,653,069 ops/s baseline, with no benchmark-specific shortcut branch in src/lib.rs or implementer-added modules.","revert_to_round":null,"reasoning":"M2 has passed and raised the official MPMC median to 1,653,069 ops/s, but the measured value size is 8 bytes and the current Slot still performs Vec clear/extend operations on every successful enqueue and dequeue. An inline representation selected from the supplied max_value_size should remove that hot-path buffer overhead without changing the exact priority publication protocol; larger values remain on the existing reusable path."}
+
 ## Round 2 — Orchestrator (pre-round)
 - **need_profile**: False
 - **profile_focus**: 
@@ -184,4 +188,32 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
   }
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
+## Round 3 — Orchestrator (pre-round)
+- **need_profile**: True
+- **profile_focus**: Measure MPMC time spent in publication-heap locking/maintenance, reservation locking, payload copying, and FFI overhead at the benchmark's 8-byte value size.
+- **reasoning**: The latest round passed and substantially improved throughput, but no recent profile identifies the dominant cost after the synchronization split. Profiling is needed to distinguish remaining heap-lock contention from copying or call overhead before selecting the next optimization.
+## Round 3 — Orchestrator (plan)
+- **reasoning**: M2 has passed and raised the official MPMC median to 1,653,069 ops/s, but the measured value size is 8 bytes and the current Slot still performs Vec clear/extend operations on every successful enqueue and dequeue. An inline representation selected from the supplied max_value_size should remove that hot-path buffer overhead without changing the exact priority publication protocol; larger values remain on the existing reusable path.
+
+### Task
+Implement Major M3 in src/lib.rs only: specialize slot storage for queues whose trusted max_value_size is at most 8 bytes with a per-slot inline [u8; 8] buffer and explicit length, so successful enqueue and dequeue copy directly without Vec growth/allocation or heap-buffer initialization in the measured fast path. Retain the lazy reusable Vec-backed path for larger configured value sizes and support every valid length from zero through max_value_size. Preserve the existing copying C ABI in src/ffi.rs, reservation-aware FULL/EMPTY behavior, minimum-priority dequeue, undersized-output retention, and slot ownership synchronization; do not add benchmark-specific payload or priority shortcuts.
+
+### Pass criteria
+The candidate builds ./priority-queue-candidate.so and the trusted accuracy gate remains fully passing. Source inspection and targeted probes confirm that max_value_size <= 8 uses inline per-slot storage for lengths 0 through 8, with no per-operation Vec allocation or growth on that path, while configurations above 8 retain correct lazy reusable storage for arbitrary supported lengths including non-word-aligned and large values. The official default MPMC benchmark reports a valid end-to-end total_ops_per_sec median above the current 1,653,069 ops/s baseline, with no benchmark-specific shortcut branch in src/lib.rs or implementer-added modules.
+
+## Round 3 — Implementer
+
+### Summary
+
+Specialized `src/lib.rs` slot payloads with an inline per-slot `[u8; 8]` buffer and explicit length whenever the configured maximum is at most 8 bytes. Inline enqueue/dequeue now use direct slice copies and length updates without Vec growth or heap-buffer initialization. Configurations above 8 bytes retain lazy reusable `Vec<u8>` storage, including reuse after the first allocation. Existing reservation/publication synchronization, priority ordering, copying ABI behavior, undersized-output retention, and capacity semantics are unchanged. Added focused tests covering every inline length from zero through eight and lazy larger-slot reuse.
+
+### Validation
+
+`cargo test --locked`, `cargo test --release --locked`, `make`, exported-symbol inspection, and native probes for value sizes 8, 9, 17, 257, and 1 MiB passed. Three 10-second native default MPMC runs measured 2,388,141, 1,511,386, and 2,701,487 successful ops/sec (median 2,388,141), above the 1,653,069 baseline. The Go wrapper accuracy command remains unavailable because the installed Go binary has no usable GOROOT; the native ABI probes passed the inline boundary, arbitrary/non-word-aligned, large-value, ownership, bounds, and concurrent retention checks.
+## Round 3 — Implementer (attempt 1)
+- **expected_behavior**: Preserves copying ABI, priority ordering, reservation-aware FULL/EMPTY, undersized-output retention, slot synchronization, and all supported value lengths.
+
+### Summary
+Implemented inline [u8; 8] slot storage for max_value_size <= 8 with explicit lengths, preserving lazy reusable Vec storage for larger values. Added focused tests and built the shared library; native probes passed and MPMC median reached 2,388,141 ops/s.
 
