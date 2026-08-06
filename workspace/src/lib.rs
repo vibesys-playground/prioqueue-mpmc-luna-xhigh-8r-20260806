@@ -2,8 +2,6 @@
 
 mod ffi;
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex};
 
 const ABI_VERSION: u32 = 1;
@@ -13,42 +11,115 @@ const STATUS_EMPTY: u32 = 2;
 const STATUS_INVALID: u32 = 3;
 const STATUS_INTERNAL_ERROR: u32 = 4;
 
-struct Entry {
+struct Slot {
     priority: u64,
     sequence: u64,
     value: Vec<u8>,
 }
 
-impl PartialEq for Entry {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+impl Slot {
+    fn new() -> Self {
+        Self {
+            priority: 0,
+            sequence: 0,
+            value: Vec::new(),
+        }
+    }
+
+    fn copy_value(&mut self, data: &[u8]) -> Result<(), ()> {
+        self.value.clear();
+        if self.value.capacity() < data.len() {
+            self.value.try_reserve_exact(data.len()).map_err(|_| ())?;
+        }
+        self.value.extend_from_slice(data);
+        Ok(())
     }
 }
 
-impl Eq for Entry {}
+struct SlotIndexHeap {
+    indices: Vec<usize>,
+}
 
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl SlotIndexHeap {
+    fn new(capacity: usize) -> Result<Self, u32> {
+        let mut indices = Vec::new();
+        indices
+            .try_reserve_exact(capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        Ok(Self { indices })
+    }
+
+    fn peek(&self) -> Option<usize> {
+        self.indices.first().copied()
+    }
+
+    fn push(&mut self, index: usize, slots: &[Slot]) {
+        self.indices.push(index);
+        let mut child = self.indices.len() - 1;
+        while child != 0 {
+            let parent = (child - 1) / 2;
+            if !comes_before(self.indices[child], self.indices[parent], slots) {
+                break;
+            }
+            self.indices.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    fn pop(&mut self, slots: &[Slot]) -> Option<usize> {
+        let root = self.indices.first().copied()?;
+        let last = self.indices.pop().expect("heap root implies a last item");
+        if !self.indices.is_empty() {
+            self.indices[0] = last;
+            let mut parent = 0;
+            loop {
+                let left = parent * 2 + 1;
+                if left >= self.indices.len() {
+                    break;
+                }
+                let right = left + 1;
+                let mut child = left;
+                if right < self.indices.len()
+                    && comes_before(self.indices[right], self.indices[left], slots)
+                {
+                    child = right;
+                }
+                if !comes_before(self.indices[child], self.indices[parent], slots) {
+                    break;
+                }
+                self.indices.swap(parent, child);
+                parent = child;
+            }
+        }
+        Some(root)
     }
 }
 
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
+fn comes_before(left: usize, right: usize, slots: &[Slot]) -> bool {
+    let left = &slots[left];
+    let right = &slots[right];
+    left.priority < right.priority
+        || (left.priority == right.priority && left.sequence < right.sequence)
 }
 
 struct Values {
     next_sequence: u64,
-    heap: BinaryHeap<Entry>,
+    slots: Vec<Slot>,
+    free_slots: Vec<usize>,
+    heap: SlotIndexHeap,
+}
+
+impl Values {
+    fn publish(&mut self, slot_index: usize) {
+        self.heap.push(slot_index, &self.slots);
+    }
+
+    fn remove_min(&mut self) -> Option<usize> {
+        self.heap.pop(&self.slots)
+    }
 }
 
 struct QueueState {
-    capacity: usize,
     max_value_size: usize,
     values: Mutex<Values>,
 }
@@ -71,18 +142,32 @@ impl Queue {
         }
         let capacity = usize::try_from(capacity).map_err(|_| STATUS_INVALID)?;
         let max_value_size = usize::try_from(max_value_size).map_err(|_| STATUS_INVALID)?;
-        let mut heap = BinaryHeap::new();
-        heap.try_reserve_exact(capacity)
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..capacity {
+            slots.push(Slot::new());
+        }
+
+        let mut free_slots = Vec::new();
+        free_slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for index in (0..capacity).rev() {
+            free_slots.push(index);
+        }
+
         Ok(Self {
             producer_count,
             consumer_count,
             state: Arc::new(QueueState {
-                capacity,
                 max_value_size,
                 values: Mutex::new(Values {
                     next_sequence: 0,
-                    heap,
+                    slots,
+                    free_slots,
+                    heap: SlotIndexHeap::new(capacity)?,
                 }),
             }),
         })
@@ -117,21 +202,20 @@ impl Producer {
         let Ok(mut values) = self.state.values.lock() else {
             return STATUS_INTERNAL_ERROR;
         };
-        if values.heap.len() == self.state.capacity {
+        let Some(slot_index) = values.free_slots.pop() else {
             return STATUS_FULL;
-        }
-        let mut value = Vec::new();
-        if value.try_reserve_exact(data.len()).is_err() {
+        };
+
+        let sequence = values.next_sequence;
+        let slot = &mut values.slots[slot_index];
+        if slot.copy_value(data).is_err() {
+            values.free_slots.push(slot_index);
             return STATUS_INTERNAL_ERROR;
         }
-        value.extend_from_slice(data);
-        let sequence = values.next_sequence;
+        slot.priority = priority;
+        slot.sequence = sequence;
         values.next_sequence = values.next_sequence.wrapping_add(1);
-        values.heap.push(Entry {
-            priority,
-            sequence,
-            value,
-        });
+        values.publish(slot_index);
         STATUS_OK
     }
 }
@@ -145,15 +229,20 @@ impl Consumer {
         let Ok(mut values) = self.state.values.lock() else {
             return Err(STATUS_INTERNAL_ERROR);
         };
-        let Some(entry) = values.heap.peek() else {
+        let Some(slot_index) = values.heap.peek() else {
             return Err(STATUS_EMPTY);
         };
-        if entry.value.len() > output.len() {
+        let slot = &values.slots[slot_index];
+        if slot.value.len() > output.len() {
             return Err(STATUS_INVALID);
         }
-        output[..entry.value.len()].copy_from_slice(&entry.value);
-        let length = entry.value.len();
-        values.heap.pop();
+        let length = slot.value.len();
+        output[..length].copy_from_slice(&slot.value);
+        let slot_index = values
+            .remove_min()
+            .expect("heap peek implies a heap item");
+        values.slots[slot_index].value.clear();
+        values.free_slots.push(slot_index);
         Ok(length)
     }
 }
@@ -178,5 +267,26 @@ mod tests {
             assert_eq!(&output[..expected.len()], expected);
         }
         assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+    }
+
+    #[test]
+    fn reusable_slots_copy_empty_and_non_word_aligned_values() {
+        let queue = Queue::new(3, 9, 1, 1).unwrap();
+        let producer = queue.producer(0).unwrap();
+        let consumer = queue.consumer(0).unwrap();
+
+        assert_eq!(producer.try_enqueue(3, &[]), STATUS_OK);
+        assert_eq!(producer.try_enqueue(2, &[0x11; 7]), STATUS_OK);
+        assert_eq!(producer.try_enqueue(1, &[0x22; 9]), STATUS_OK);
+
+        let mut empty = [];
+        assert_eq!(consumer.try_dequeue(&mut empty), Err(STATUS_INVALID));
+
+        let mut output = [0_u8; 9];
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(9));
+        assert_eq!(output, [0x22; 9]);
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(7));
+        assert_eq!(&output[..7], &[0x11; 7]);
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(0));
     }
 }
