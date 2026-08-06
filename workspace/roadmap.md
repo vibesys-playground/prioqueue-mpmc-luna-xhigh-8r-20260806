@@ -70,9 +70,10 @@ acceptance"); read it before parking or abandoning.
 
 - **M1 — `done` (round 1): Preallocated reusable item slots and heap indices.** The bounded slot pool, reusable value buffers, free-slot stack, and slot-index heap removed per-enqueue heap-object allocation; the trusted MPMC benchmark improved from the naive baseline to 843,086 total ops/s.
 - **M2 — `done` (rounds 2-3): Reduce MPMC serialization in priority publication/removal.** Split capacity reservation/recycling from published-heap access, use short-held cache-aligned spin locks, and keep payload copying out of shared locks; the official benchmark reached 1,653,069 total ops/s while all accuracy scenarios passed.
-- **M3 — `in_progress` (round 3): Specialize the measured value-size path.** Keep copying semantics for every configured size while making max-value sizes at or below 8 bytes use compact inline/direct storage and making larger values retain lazy reusable buffers; this targets the benchmark's end-to-end copy and Vec overhead.
-- **M4 — `todo`: Benchmark-driven queue-mode specialization.** Use the trusted producer/consumer counts and capacity to select cheaper SPSC/MPSC/SPMC paths where permitted, while retaining the exact minimum-priority and reservation-aware MPMC contract; this targets avoidable synchronization in non-MPMC checks and provides comparison data for M2.
-- **M5 — `todo`: Alternative exact-priority publication structures.** Evaluate a cache-efficient or sharded publication representation only if profiling shows binary-heap maintenance and its single publication lock remain dominant after M3; this is the next structural contention lever for the 4P/4C workload.
+- **M3 — `done` (round 3): Specialize the measured value-size path.** Inline storage for max-value sizes at or below 8 bytes and lazy reusable buffers for larger values removed the measured Vec growth/initialization overhead while retaining copying semantics; the official benchmark rose to 2,190,294 ops/s.
+- **M4 — `abandoned` (round 9 decision): Benchmark-driven queue-mode specialization for non-MPMC cases.** The trusted headline workload always creates the queue with 4 producers and 4 consumers, so SPSC/MPSC/SPMC branches are never selected on the scored hot path; this code-level dispatch condition cannot reduce the 4P/4C publication serialization that determines `total_ops_per_sec`.
+- **M5 — `in_progress` (round 9, first slice): Sharded exact-priority publication.** Replace the one shared publication heap/lock with a small fixed set of cache-aligned heaps so producers contend only within one shard, while consumers perform an exact global-min selection with validation/retry; this targets the remaining 4P/4C publication serialization and heap maintenance.
+- **M8 — `done` (rounds 7-8): Contention-aware publication/reservation lock wait policy.** Immediate acquisition followed by bounded CPU spinning and scheduler yielding avoided pathological retry overhead under the evaluator's thread contention; the accepted official benchmark reached 6,179,290 ops/s.
 
 ## Minor
 
@@ -88,4 +89,4 @@ acceptance"); read it before parking or abandoning.
 
 ## Abandoned
 
-(none yet)
+- **M4:** The scored runner's fixed 4P/4C construction means a non-MPMC specialization branch is unreachable during the headline benchmark, so it cannot affect the measured path; revisit only if the objective changes to include non-MPMC throughput.

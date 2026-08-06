@@ -5,7 +5,7 @@ mod ffi;
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const ABI_VERSION: u32 = 1;
@@ -16,6 +16,7 @@ const STATUS_INVALID: u32 = 3;
 const STATUS_INTERNAL_ERROR: u32 = 4;
 
 const INLINE_VALUE_CAPACITY: usize = 8;
+const PUBLICATION_SHARD_COUNT: usize = 2;
 const LOCK_SPIN_ATTEMPTS: usize = 4096;
 const LOCK_YIELD_ATTEMPTS: usize = 1;
 
@@ -169,7 +170,7 @@ struct SlotIndexHeap {
     entries: Vec<PublishedEntry>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct PublishedEntry {
     priority: u64,
     slot_index: usize,
@@ -239,6 +240,11 @@ fn comes_before(left: PublishedEntry, right: PublishedEntry) -> bool {
         || (left.priority == right.priority && left.slot_index < right.slot_index)
 }
 
+#[inline]
+fn root_priority(entry: Option<PublishedEntry>) -> Option<u64> {
+    entry.map(|entry| entry.priority)
+}
+
 struct ReservationState {
     free_slots: Vec<usize>,
 }
@@ -247,11 +253,71 @@ struct PublishedState {
     heap: SlotIndexHeap,
 }
 
+#[derive(Clone, Copy)]
+struct RootObservation {
+    priority: u64,
+}
+
+// Readers use this acquire/release root summary to inspect a shard without
+// taking its heap lock. The heap remains the source of truth, and the selected
+// shard is always revalidated under its lock before a removal.
+#[repr(align(64))]
+struct RootSummary {
+    priority: AtomicU64,
+    max_priority_present: AtomicBool,
+}
+
+impl RootSummary {
+    fn new() -> Self {
+        Self {
+            priority: AtomicU64::new(u64::MAX),
+            max_priority_present: AtomicBool::new(false),
+        }
+    }
+
+    fn publish(&self, entry: Option<PublishedEntry>) {
+        let priority = entry.map_or(u64::MAX, |entry| entry.priority);
+        self.priority.store(priority, Ordering::Relaxed);
+        self.max_priority_present.store(
+            entry.is_some_and(|entry| entry.priority == u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    #[inline]
+    fn observe(&self) -> Option<RootObservation> {
+        let priority = self.priority.load(Ordering::Relaxed);
+        if priority != u64::MAX {
+            return Some(RootObservation { priority });
+        }
+        self.max_priority_present
+            .load(Ordering::Acquire)
+            .then_some(RootObservation { priority })
+    }
+}
+
+#[repr(align(64))]
+struct PublicationShard {
+    published: SpinMutex<PublishedState>,
+    root: RootSummary,
+}
+
+impl PublicationShard {
+    fn new(capacity: usize) -> Result<Self, u32> {
+        Ok(Self {
+            published: SpinMutex::new(PublishedState {
+                heap: SlotIndexHeap::new(capacity)?,
+            }),
+            root: RootSummary::new(),
+        })
+    }
+}
+
 struct QueueState {
     max_value_size: usize,
     slots: Vec<UnsafeCell<Slot>>,
     reservation: SpinMutex<ReservationState>,
-    published: SpinMutex<PublishedState>,
+    publication_shards: Vec<PublicationShard>,
 }
 
 // A slot is owned by exactly one phase at a time:
@@ -309,6 +375,18 @@ impl Queue {
             free_slots.push(index);
         }
 
+        let shard_count = capacity.min(PUBLICATION_SHARD_COUNT);
+        let shard_capacity = capacity / shard_count;
+        let extra_shards = capacity % shard_count;
+        let mut publication_shards = Vec::new();
+        publication_shards
+            .try_reserve_exact(shard_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for shard_index in 0..shard_count {
+            let capacity = shard_capacity + usize::from(shard_index < extra_shards);
+            publication_shards.push(PublicationShard::new(capacity)?);
+        }
+
         Ok(Self {
             producer_count,
             consumer_count,
@@ -316,9 +394,7 @@ impl Queue {
                 max_value_size,
                 slots,
                 reservation: SpinMutex::new(ReservationState { free_slots }),
-                published: SpinMutex::new(PublishedState {
-                    heap: SlotIndexHeap::new(capacity)?,
-                }),
+                publication_shards,
             }),
         })
     }
@@ -335,6 +411,7 @@ impl Queue {
         (id < self.consumer_count)
             .then(|| Consumer {
                 state: Arc::clone(&self.state),
+                shard_start: ((id as usize) + 1) % self.state.publication_shards.len(),
             })
             .ok_or(STATUS_INVALID)
     }
@@ -368,14 +445,21 @@ impl Producer {
             return STATUS_INTERNAL_ERROR;
         }
         {
-            let mut published = self.state.published.lock();
+            let shard_index = slot_index % self.state.publication_shards.len();
+            let shard = &self.state.publication_shards[shard_index];
+            let mut published = shard.published.lock();
 
             // Publication is short-held and only touches heap/index metadata.
             // The payload was fully copied before this lock was acquired.
+            let previous_root = root_priority(published.heap.peek());
             published.heap.push(PublishedEntry {
                 priority,
                 slot_index,
             });
+            let next_root = published.heap.peek();
+            if root_priority(next_root) != previous_root {
+                shard.root.publish(next_root);
+            }
         }
         STATUS_OK
     }
@@ -383,16 +467,73 @@ impl Producer {
 
 pub struct Consumer {
     state: Arc<QueueState>,
+    shard_start: usize,
 }
 
 impl Consumer {
     fn try_dequeue(&self, output: &mut [u8]) -> Result<usize, u32> {
-        let (slot_index, length) = {
-            let mut published = self.state.published.lock();
-            let Some(entry) = published.heap.peek() else {
+        let (slot_index, length) = loop {
+            let mut observations: [Option<RootObservation>; PUBLICATION_SHARD_COUNT] =
+                [None; PUBLICATION_SHARD_COUNT];
+            let mut selected: Option<(usize, RootObservation)> = None;
+            let shard_count = self.state.publication_shards.len();
+            for offset in 0..shard_count {
+                let shard_index = (self.shard_start + offset) % shard_count;
+                let shard = &self.state.publication_shards[shard_index];
+                let Some(observation) = shard.root.observe() else {
+                    continue;
+                };
+                observations[shard_index] = Some(observation);
+                if selected.as_ref().map_or(true, |(_, current)| {
+                    observation.priority < current.priority
+                }) {
+                    selected = Some((shard_index, observation));
+                }
+            }
+            let Some((shard_index, _observation)) = selected else {
                 return Err(STATUS_EMPTY);
             };
-            let length = unsafe { self.state.slot(entry.slot_index) }.len();
+
+            let shard = &self.state.publication_shards[shard_index];
+            let mut published = shard.published.lock();
+            let Some(current) = published.heap.peek() else {
+                continue;
+            };
+
+            // The optimistic root only identifies a likely winner. If that
+            // shard changed before its lock was acquired, use its current
+            // heap root and validate it against the shard-root observations
+            // while retaining the selected lock. A changed selected root
+            // triggers fresh observations for the other shards.
+            let selected_root_unchanged = observations[shard_index]
+                .is_some_and(|root| root.priority == current.priority);
+            let another_shard_has_lower_root = if selected_root_unchanged {
+                observations.iter().enumerate().any(|(candidate_index, candidate)| {
+                    candidate_index != shard_index
+                        && candidate.is_some_and(|candidate_root| {
+                            candidate_root.priority < current.priority
+                        })
+                })
+            } else {
+                self.state
+                    .publication_shards
+                    .iter()
+                    .enumerate()
+                    .any(|(candidate_index, candidate)| {
+                        candidate_index != shard_index
+                            && candidate
+                                .root
+                                .observe()
+                                .is_some_and(|candidate_root| {
+                                    candidate_root.priority < current.priority
+                                })
+                    })
+            };
+            if another_shard_has_lower_root {
+                continue;
+            }
+
+            let length = unsafe { self.state.slot(current.slot_index) }.len();
             if length > output.len() {
                 return Err(STATUS_INVALID);
             }
@@ -402,7 +543,11 @@ impl Consumer {
                 .heap
                 .pop()
                 .expect("heap peek implies a heap item");
-            (entry.slot_index, length)
+            let next_root = published.heap.peek();
+            if root_priority(next_root) != Some(entry.priority) {
+                shard.root.publish(next_root);
+            }
+            break (entry.slot_index, length);
         };
 
         {
