@@ -393,3 +393,12 @@ Debug/release `cargo test --locked`, `make`, ABI symbol inspection, and native p
 ### Summary
 Implemented aligned, capacity-aware publication shards with deterministic slot routing, atomic root summaries, exact minimum selection, shard-lock revalidation, and preserved ABI/storage semantics. Tests, build, and native probes pass; Go accuracy gate was unavailable.
 
+## Round 8 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully, exports the required ABI, passes Rust tests, all 100-trial SPSC/MPSC/SPMC/MPMC accuracy checks, and ABI profiles for small capacities and values up to 1 MiB. Enqueue publication uses one shard lock. However, dequeue validation is not sound: relaxed root-summary loads can miss a lower-priority item on another shard, allowing a non-minimum dequeue. The separate u64::MAX sentinel flag also permits observing MAX plus a stale false flag. The official 10-second, 3-repetition benchmark produced a median of 4,738,382 ops/sec, below the 6,179,290 baseline.
+
+### Feedback
+Fix root-summary synchronization and global-min validation so stale or missed shard summaries cannot produce a non-minimum dequeue or false EMPTY; use a synchronized version/state representation and revalidate all relevant shards. Handle priority u64::MAX without the current split-store race. Then rerun the official benchmark and improve its three-run median above 6,179,290 ops/sec.
+
