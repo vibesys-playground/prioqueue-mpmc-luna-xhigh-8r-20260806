@@ -340,3 +340,41 @@ The candidate builds priority-queue-candidate.so and exports all required ABI sy
 ### Feedback
 Improve unpinned default 4P/4C MPMC throughput so the trusted three-repetition median strictly exceeds 2,190,294 total_ops_per_sec. Validate using the evaluator's exact benchmark command; CPU-pinned results alone do not satisfy this criterion.
 
+## Round 5 — Judge loop exhausted
+- **attempts**: 3
+- **last_feedback**: Improve unpinned default 4P/4C MPMC throughput so the trusted three-repetition median strictly exceeds 2,190,294 total_ops_per_sec. Validate using the evaluator's exact benchmark command; CPU-pinned results alone do not satisfy this criterion.
+
+## Round 6 — Orchestrator (pre-round)
+- **need_profile**: False
+- **profile_focus**: 
+- **reasoning**: The previous judge loop exhausted after three failed attempts, so profiling this implementation would waste time. Skip profiling and plan a simpler, low-risk optimization guided by code inspection.
+
+## Round 6 — Orchestrator (plan)
+- **task**: Serve M5 with one narrow source-only optimization in `src/lib.rs`: rewrite `SlotIndexHeap::push` so the new `PublishedEntry` is sifted upward using raw pointer accesses and shift-based parent arithmetic, writing the carried entry only once at its final position instead of pre-writing it and then overwriting it. Preserve the exact `comes_before` comparator, preallocated capacity, and current heap representation. Do not alter `SpinMutex`, reservation/recycling, dequeue removal, slot storage, the C ABI, or the queue's concurrency protocol. Retain or add focused heap/queue tests for ordering, equal-priority tie behavior, and bounded capacity.
+- **pass_criteria**: The candidate builds `./priority-queue-candidate.so`, exports the required copying ABI, and the trusted accuracy checker passes all scenarios. Source inspection confirms that `SlotIndexHeap::push` remains allocation-free, preserves exact minimum-priority behavior and equal-priority validity, and uses the reduced-write/raw-pointer fast path without any benchmark-specific branch; no unrelated lock, reservation, dequeue, storage, or ABI changes are required. The evaluator's exact default MPMC benchmark (`go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpmc --repetitions 3`) reports a valid three-repetition median strictly greater than `2,190,294` `total_ops_per_sec`.
+- **revert_to_round**: null
+- **reasoning**: M3 is complete, while M6 is parked because its unpinned result was unstable and correctness evidence does not justify abandoning the direction. The current enqueue heap push performs an avoidable initial write of the new entry and uses safe indexing inside the sift loop; removing only those costs affects every successful enqueue and is substantially smaller and lower-risk than another publication/reservation contention rewrite.
+## Round 6 — Orchestrator (plan)
+- **reasoning**: M3 is complete and M6 is parked after unstable unpinned results. This smaller push-only change removes an avoidable heap write and bounds-check overhead on every successful enqueue without repeating the failed contention rewrite.
+
+### Task
+Serve M5 with one narrow optimization in src/lib.rs: rewrite SlotIndexHeap::push to sift entries using raw-pointer accesses and shift-based parent arithmetic, writing the new PublishedEntry only once at its final position. Preserve exact ordering, preallocated capacity, and all existing locks, reservation/recycling, dequeue, storage, ABI, and concurrency behavior.
+
+### Pass criteria
+Build ./priority-queue-candidate.so with the required ABI; all trusted accuracy scenarios pass; heap push remains allocation-free and preserves minimum-priority and equal-priority semantics; the exact evaluator MPMC benchmark reports a three-repetition median strictly above 2,190,294 total_ops_per_sec, with no benchmark-specific shortcut.
+
+## Round 6 — Implementer (M5)
+
+### Summary
+
+Rewrote `SlotIndexHeap::push` in `src/lib.rs` as a raw-pointer sift-up. Parent entries are read and shifted with `(child - 1) >> 1`, and the incoming `PublishedEntry` is written only once at its final heap position before the preallocated vector length is updated. The comparator, heap capacity, locks, reservation/recycling, dequeue path, slot storage, ABI, and concurrency protocol were left unchanged.
+
+### Validation
+
+`cargo test --locked`, `cargo test --release --locked`, `make`, required ABI symbol inspection, and native ABI probes for value sizes 8, 9, 17, 257, and 1 MiB passed. The exact Go evaluator command could not run because the installed Go binary has no usable `GOROOT`. The equivalent unpinned native benchmark configuration produced 2,039,587, 1,452,972, and 1,748,222 total ops/sec (median 1,748,222), below the strict 2,190,294 target on this host.
+## Round 6 — Implementer (attempt 1)
+- **expected_behavior**: Preserves allocation-free heap insertion, exact priority/tie ordering, capacity, locks, recycling, dequeue, storage, ABI, and concurrency semantics.
+
+### Summary
+Rewrote SlotIndexHeap::push with raw-pointer sift-up, shift-based parent arithmetic, and one final entry write. Build, tests, ABI checks, and native probes passed. Go evaluator was unavailable; native median was 1,748,222 ops/s.
+

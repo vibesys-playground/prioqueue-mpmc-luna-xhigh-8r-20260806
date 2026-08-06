@@ -215,21 +215,23 @@ impl SlotIndexHeap {
 
     #[inline]
     fn push(&mut self, entry: PublishedEntry) {
-        let mut child = self.entries.len();
-        debug_assert!(child < self.entries.capacity());
-        unsafe {
-            self.entries.as_mut_ptr().add(child).write(entry);
-            self.entries.set_len(child + 1);
-        }
+        let final_length = self.entries.len() + 1;
+        debug_assert!(final_length <= self.entries.capacity());
+        let entries = self.entries.as_mut_ptr();
+        let mut child = final_length - 1;
         while child != 0 {
-            let parent = (child - 1) / 2;
-            if !comes_before(entry, self.entries[parent]) {
+            let parent = (child - 1) >> 1;
+            let parent_entry = unsafe { *entries.add(parent) };
+            if !comes_before(entry, parent_entry) {
                 break;
             }
-            self.entries[child] = self.entries[parent];
+            unsafe { entries.add(child).write(parent_entry) };
             child = parent;
         }
-        self.entries[child] = entry;
+        unsafe {
+            entries.add(child).write(entry);
+            self.entries.set_len(final_length);
+        }
     }
 
     #[inline(always)]
