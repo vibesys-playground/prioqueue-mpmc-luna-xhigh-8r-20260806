@@ -143,3 +143,10 @@ Build succeeds and produces ./priority-queue-candidate.so with all required ABI 
 ### Feedback
 
 
+## Round 2 — Framework accuracy gate (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . check --workspace ../.. --scenario mpmc --operations 24 --trials 100`
+
+### Output
+PASS - mpmc reservation-aware bounded priority queue (100 trials, approximately 24 ops/trial, 4P/4C, capacity=1024, value_size=8)
+
