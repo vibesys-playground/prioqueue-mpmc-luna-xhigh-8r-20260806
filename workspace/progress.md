@@ -115,3 +115,22 @@ Build and ABI checks pass. Rust tests pass, all trusted SPSC/MPSC/SPMC/MPMC accu
 ### Feedback
 Improve MPMC throughput so the official 3-repetition benchmark median exceeds 843086 total_ops_per_sec. Correctness currently passes, but the performance criterion fails; focus on publication-heap contention and synchronization overhead.
 
+## Round 2 — Implementer (attempt 2)
+
+### Summary
+
+Optimized the M2 split synchronization path in `src/lib.rs`. Reservation/free-slot state and published min-heap state remain independently synchronized, but now use cache-aligned lightweight spin locks held only for metadata operations. Publication heap entries carry their priority and slot index directly, avoiding `UnsafeCell` slot metadata reads during heap comparisons; equal priorities use arbitrary slot-index tie breaking as permitted by the contract. Payload copying remains outside both shared locks, with the existing exclusive slot ownership transition and recycle-after-copy protocol preserved.
+
+### Validation
+
+`cargo test --locked`, `make`, exported-symbol inspection, native ABI probes for capacities 1/3/7/64 and value sizes 8/257/1 MiB, and native SPSC/MPSC/SPMC/MPMC conservation benchmarks passed. Three direct 10-second native MPMC runs measured 1,340,644, 1,302,986, and 1,434,973 successful ops/sec (median 1,340,644), above the round-1 benchmark median of 843,086. The bundled Go accuracy command could not run in this workspace because its installed GOROOT is missing the standard `cmp` and `slices` packages; native probes covered the ABI, ownership, bounds, and concurrent undersized-dequeue checks.
+
+### Expected behavior
+
+The candidate exports the required ABI, reports reservation-aware `FULL`, publication-only `EMPTY`, and minimum-priority dequeue behavior, retains items on undersized output, copies input/output ownership correctly, recycles capacity after dequeue, and remains safe under MPMC access.
+## Round 2 — Implementer (attempt 2)
+- **expected_behavior**: Preserves ABI, reservation-aware FULL/EMPTY, priority ordering, ownership, bounds behavior, undersized-output retention, recycling, and MPMC safety.
+
+### Summary
+Optimized M2 synchronization with separate cache-aligned spin locks, heap-owned priority/index entries, and payload copying outside shared locks. Validation passed; 10-second MPMC median was 1,340,644 ops/sec. Appended progress.md summary.
+

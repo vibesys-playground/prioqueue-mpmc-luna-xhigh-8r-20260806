@@ -3,7 +3,10 @@
 mod ffi;
 
 use std::cell::UnsafeCell;
-use std::sync::{Arc, Mutex};
+use std::hint::spin_loop;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const ABI_VERSION: u32 = 1;
 const STATUS_OK: u32 = 0;
@@ -13,16 +16,12 @@ const STATUS_INVALID: u32 = 3;
 const STATUS_INTERNAL_ERROR: u32 = 4;
 
 struct Slot {
-    priority: u64,
-    sequence: u64,
     value: Vec<u8>,
 }
 
 impl Slot {
     fn new() -> Self {
         Self {
-            priority: 0,
-            sequence: 0,
             value: Vec::new(),
         }
     }
@@ -37,58 +36,130 @@ impl Slot {
     }
 }
 
+#[repr(align(64))]
+struct SpinMutex<T> {
+    locked: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+struct SpinMutexGuard<'a, T> {
+    mutex: &'a SpinMutex<T>,
+}
+
+impl<T> SpinMutex<T> {
+    fn new(value: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    #[inline]
+    fn lock(&self) -> SpinMutexGuard<'_, T> {
+        loop {
+            if self
+                .locked
+                .compare_exchange_weak(
+                    false,
+                    true,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return SpinMutexGuard { mutex: self };
+            }
+            while self.locked.load(Ordering::Relaxed) {
+                spin_loop();
+            }
+        }
+    }
+}
+
+unsafe impl<T: Send> Sync for SpinMutex<T> {}
+unsafe impl<T: Send> Send for SpinMutex<T> {}
+
+impl<T> Deref for SpinMutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T> DerefMut for SpinMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T> Drop for SpinMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, Ordering::Release);
+    }
+}
+
 struct SlotIndexHeap {
-    indices: Vec<usize>,
+    entries: Vec<PublishedEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct PublishedEntry {
+    priority: u64,
+    slot_index: usize,
 }
 
 impl SlotIndexHeap {
     fn new(capacity: usize) -> Result<Self, u32> {
-        let mut indices = Vec::new();
-        indices
+        let mut entries = Vec::new();
+        entries
             .try_reserve_exact(capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        Ok(Self { indices })
+        Ok(Self { entries })
     }
 
-    fn peek(&self) -> Option<usize> {
-        self.indices.first().copied()
+    #[inline]
+    fn peek(&self) -> Option<PublishedEntry> {
+        self.entries.first().copied()
     }
 
-    unsafe fn push(&mut self, index: usize, slots: &[UnsafeCell<Slot>]) {
-        self.indices.push(index);
-        let mut child = self.indices.len() - 1;
+    #[inline]
+    fn push(&mut self, entry: PublishedEntry) {
+        self.entries.push(entry);
+        let mut child = self.entries.len() - 1;
         while child != 0 {
             let parent = (child - 1) / 2;
-            if !unsafe { comes_before(self.indices[child], self.indices[parent], slots) } {
+            if !comes_before(self.entries[child], self.entries[parent]) {
                 break;
             }
-            self.indices.swap(child, parent);
+            self.entries.swap(child, parent);
             child = parent;
         }
     }
 
-    unsafe fn pop(&mut self, slots: &[UnsafeCell<Slot>]) -> Option<usize> {
-        let root = self.indices.first().copied()?;
-        let last = self.indices.pop().expect("heap root implies a last item");
-        if !self.indices.is_empty() {
-            self.indices[0] = last;
+    #[inline]
+    fn pop(&mut self) -> Option<PublishedEntry> {
+        let root = self.entries.first().copied()?;
+        let last = self.entries.pop().expect("heap root implies a last item");
+        if !self.entries.is_empty() {
+            self.entries[0] = last;
             let mut parent = 0;
             loop {
                 let left = parent * 2 + 1;
-                if left >= self.indices.len() {
+                if left >= self.entries.len() {
                     break;
                 }
                 let right = left + 1;
                 let mut child = left;
-                if right < self.indices.len()
-                    && unsafe { comes_before(self.indices[right], self.indices[left], slots) }
+                if right < self.entries.len()
+                    && comes_before(self.entries[right], self.entries[left])
                 {
                     child = right;
                 }
-                if !unsafe { comes_before(self.indices[child], self.indices[parent], slots) } {
+                if !comes_before(self.entries[child], self.entries[parent]) {
                     break;
                 }
-                self.indices.swap(parent, child);
+                self.entries.swap(parent, child);
                 parent = child;
             }
         }
@@ -96,15 +167,13 @@ impl SlotIndexHeap {
     }
 }
 
-unsafe fn comes_before(left: usize, right: usize, slots: &[UnsafeCell<Slot>]) -> bool {
-    let left = unsafe { &*slots[left].get() };
-    let right = unsafe { &*slots[right].get() };
+#[inline]
+fn comes_before(left: PublishedEntry, right: PublishedEntry) -> bool {
     left.priority < right.priority
-        || (left.priority == right.priority && left.sequence < right.sequence)
+        || (left.priority == right.priority && left.slot_index < right.slot_index)
 }
 
 struct ReservationState {
-    next_sequence: u64,
     free_slots: Vec<usize>,
 }
 
@@ -115,8 +184,8 @@ struct PublishedState {
 struct QueueState {
     max_value_size: usize,
     slots: Vec<UnsafeCell<Slot>>,
-    reservation: Mutex<ReservationState>,
-    published: Mutex<PublishedState>,
+    reservation: SpinMutex<ReservationState>,
+    published: SpinMutex<PublishedState>,
 }
 
 // A slot is owned by exactly one phase at a time:
@@ -180,11 +249,8 @@ impl Queue {
             state: Arc::new(QueueState {
                 max_value_size,
                 slots,
-                reservation: Mutex::new(ReservationState {
-                    next_sequence: 0,
-                    free_slots,
-                }),
-                published: Mutex::new(PublishedState {
+                reservation: SpinMutex::new(ReservationState { free_slots }),
+                published: SpinMutex::new(PublishedState {
                     heap: SlotIndexHeap::new(capacity)?,
                 }),
             }),
@@ -217,16 +283,12 @@ impl Producer {
         if data.len() > self.state.max_value_size {
             return STATUS_INVALID;
         }
-        let (slot_index, sequence) = {
-            let Ok(mut reservation) = self.state.reservation.lock() else {
-                return STATUS_INTERNAL_ERROR;
-            };
+        let slot_index = {
+            let mut reservation = self.state.reservation.lock();
             let Some(slot_index) = reservation.free_slots.pop() else {
                 return STATUS_FULL;
             };
-            let sequence = reservation.next_sequence;
-            reservation.next_sequence = reservation.next_sequence.wrapping_add(1);
-            (slot_index, sequence)
+            slot_index
         };
 
         // The reservation gives this producer exclusive access to the slot.
@@ -235,29 +297,20 @@ impl Producer {
             .copy_value(data)
             .is_err()
         {
-            let Ok(mut reservation) = self.state.reservation.lock() else {
-                return STATUS_INTERNAL_ERROR;
-            };
+            let mut reservation = self.state.reservation.lock();
             reservation.free_slots.push(slot_index);
             return STATUS_INTERNAL_ERROR;
         }
         {
-            let slot = unsafe { self.state.slot_mut(slot_index) };
-            slot.priority = priority;
-            slot.sequence = sequence;
+            let mut published = self.state.published.lock();
+
+            // Publication is short-held and only touches heap/index metadata.
+            // The payload was fully copied before this lock was acquired.
+            published.heap.push(PublishedEntry {
+                priority,
+                slot_index,
+            });
         }
-
-        let Ok(mut published) = self.state.published.lock() else {
-            let Ok(mut reservation) = self.state.reservation.lock() else {
-                return STATUS_INTERNAL_ERROR;
-            };
-            reservation.free_slots.push(slot_index);
-            return STATUS_INTERNAL_ERROR;
-        };
-
-        // Publication is short-held and only touches heap/index metadata. The
-        // payload was fully copied before this lock was acquired.
-        unsafe { published.heap.push(slot_index, &self.state.slots) };
         STATUS_OK
     }
 }
@@ -269,21 +322,21 @@ pub struct Consumer {
 impl Consumer {
     fn try_dequeue(&self, output: &mut [u8]) -> Result<usize, u32> {
         let (slot_index, length) = {
-            let Ok(mut published) = self.state.published.lock() else {
-                return Err(STATUS_INTERNAL_ERROR);
-            };
-            let Some(slot_index) = published.heap.peek() else {
+            let mut published = self.state.published.lock();
+            let Some(entry) = published.heap.peek() else {
                 return Err(STATUS_EMPTY);
             };
-            let length = unsafe { self.state.slot(slot_index) }.value.len();
+            let length = unsafe { self.state.slot(entry.slot_index) }.value.len();
             if length > output.len() {
                 return Err(STATUS_INVALID);
             }
             // Removing the index transfers exclusive slot ownership to this
             // consumer. Do not hold publication while copying the payload.
-            let slot_index = unsafe { published.heap.pop(&self.state.slots) }
+            let entry = published
+                .heap
+                .pop()
                 .expect("heap peek implies a heap item");
-            (slot_index, length)
+            (entry.slot_index, length)
         };
 
         {
@@ -294,9 +347,7 @@ impl Consumer {
         // The consumer still owns the slot while clearing it. Only then make
         // it visible to a producer again.
         unsafe { self.state.slot_mut(slot_index) }.value.clear();
-        let Ok(mut reservation) = self.state.reservation.lock() else {
-            return Err(STATUS_INTERNAL_ERROR);
-        };
+        let mut reservation = self.state.reservation.lock();
         reservation.free_slots.push(slot_index);
         Ok(length)
     }
