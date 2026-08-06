@@ -326,3 +326,38 @@ Build and Rust tests pass, and priority-queue-candidate.so exports the required 
 ### Output
 PASS - mpmc reservation-aware bounded priority queue (100 trials, approximately 24 ops/trial, 4P/4C, capacity=1024, value_size=8)
 
+## Round 7 — Framework benchmark (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpmc --repetitions 3`
+- **total_ops_per_sec**: 6179289.876765
+
+### Output
+Scenario: mpmc  Repetitions: 3  Median successful ops/s: 6179290
+  Samples: [5.792013669037e+06 6.179289876765e+06 8.199813631254e+06]
+Scenario: mpmc  Duration: 10.000s  Prod: 4  Cons: 4
+  Enqueued: 30898050  Full: 204963262  Dequeued: 30897076  Empty: 199862348
+  Successful: 61795126  Attempts: 466620736 (6179290 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "mpmc",
+    "enqueued": 30898050,
+    "dropped": 204963262,
+    "dequeued": 30897076,
+    "empty": 199862348,
+    "attempts": 466620736,
+    "duration": 10.000360435,
+    "total_ops_per_sec": 6179289.876765,
+    "producers": 4,
+    "consumers": 4,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      5792013.669037,
+      6179289.876765,
+      8199813.631254
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
