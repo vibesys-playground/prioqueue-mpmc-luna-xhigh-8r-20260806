@@ -398,3 +398,12 @@ Debug/release Rust tests, `make`, ABI symbol checks, and native probes for capac
 ### Summary
 Refined SlotIndexHeap::push with always-inlined raw-pointer sift-up, shift-based parent arithmetic, and one final entry write. Added heap ordering/tie tests; builds, tests, probes, and ABI checks pass.
 
+## Round 6 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully as ./priority-queue-candidate.so and exports the complete required ABI. Debug/release Rust tests, native runner tests, ABI probes for 8-byte, 257-byte, and 1 MiB values, ownership, bounds, priority, and concurrent retention behavior pass. The preallocated slot-index heap is allocation-free on push and preserves minimum-priority and equal-priority semantics. The full Go checker could not run because the installed Go toolchain has no usable GOROOT. Using the trusted native runner with the exact default MPMC configuration produced 1,927,367.90, 2,108,806.99, and 1,842,153.78 total_ops_per_sec; the three-run median was 1,927,367.90, below the required strict threshold of 2,190,294. No benchmark-specific shortcut was found.
+
+### Feedback
+Improve unpinned default 4P/4C MPMC throughput so the exact three-repetition median exceeds 2,190,294 total_ops_per_sec. The globally serialized publication heap and reservation/recycling spin locks remain the likely bottlenecks. Re-run the exact evaluator command, and restore a usable Go GOROOT to verify the complete trusted accuracy gate.
+
