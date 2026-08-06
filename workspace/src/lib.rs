@@ -208,12 +208,12 @@ impl SlotIndexHeap {
         Ok(Self { entries })
     }
 
-    #[inline(always)]
+    #[inline]
     fn peek(&self) -> Option<PublishedEntry> {
         self.entries.first().copied()
     }
 
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, entry: PublishedEntry) {
         let final_length = self.entries.len() + 1;
         debug_assert!(final_length <= self.entries.capacity());
@@ -221,15 +221,15 @@ impl SlotIndexHeap {
         let mut child = final_length - 1;
         while child != 0 {
             let parent = (child - 1) >> 1;
-            let parent_entry = unsafe { *entries.add(parent) };
+            let parent_entry = unsafe { ptr::read(entries.add(parent)) };
             if !comes_before(entry, parent_entry) {
                 break;
             }
-            unsafe { entries.add(child).write(parent_entry) };
+            unsafe { ptr::write(entries.add(child), parent_entry) };
             child = parent;
         }
         unsafe {
-            entries.add(child).write(entry);
+            ptr::write(entries.add(child), entry);
             self.entries.set_len(final_length);
         }
     }
@@ -545,6 +545,25 @@ mod tests {
             assert_eq!(&output[..expected.len()], expected);
         }
         assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+    }
+
+    #[test]
+    fn slot_index_heap_sifts_minimum_and_equal_priority_entries() {
+        let mut heap = SlotIndexHeap::new(6).unwrap();
+        for (priority, slot_index) in [(9, 5), (4, 3), (4, 1), (8, 0), (4, 2), (1, 4)] {
+            heap.push(PublishedEntry {
+                priority,
+                slot_index,
+            });
+        }
+
+        for (priority, slot_index) in [(1, 4), (4, 1), (4, 2), (4, 3), (8, 0), (9, 5)] {
+            let root = heap.peek().expect("heap should contain the next entry");
+            assert_eq!((root.priority, root.slot_index), (priority, slot_index));
+            let removed = heap.pop(root);
+            assert_eq!((removed.priority, removed.slot_index), (priority, slot_index));
+        }
+        assert!(heap.peek().is_none());
     }
 
     #[test]
