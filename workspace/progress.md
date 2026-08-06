@@ -438,3 +438,12 @@ Improve default 4P/4C MPMC end-to-end throughput so the trusted benchmark median
 ### Summary
 Implemented capacity-aware sharded publication with aligned per-shard heaps, root summaries, deterministic routing, and dequeue revalidation in src/lib.rs. Builds, tests, ABI probes, and edge-size probes pass; Go accuracy gate was unavailable due missing GOROOT.
 
+## Round 8 — Judge (attempt 3)
+- **verdict**: fail
+
+### Analysis
+Builds successfully, exports the required ABI, and Rust/evaluator unit tests pass. The 20-trial all-scenario check passed, but the 100-trial gate found an SPSC violation at capacity 2: a dequeue removed an item from publication while retaining its slot, allowing an overlapping enqueue to return FULL below logical capacity. The official 4P/4C benchmark median was 4,641,809 ops/s, below the 6,179,290 baseline. Shard-local publication and value-size handling are otherwise present.
+
+### Feedback
+Fix non-MPMC linearizability by aligning capacity release with dequeue linearization while preserving safe slot ownership during output copying; the current delayed slot recycling causes false FULL results. The failing history is SPSC capacity 2, where dequeue call 27–36 returns priority 7, enqueue call 28–29 publishes priority 4, and enqueue call 30–31 returns FULL. Also improve the official 4P/4C MPMC median above 6,179,290 ops/s; the measured median was 4,641,809.
+
