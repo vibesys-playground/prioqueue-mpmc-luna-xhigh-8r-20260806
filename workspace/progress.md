@@ -324,3 +324,12 @@ Reworked the publication path in `src/lib.rs` around a truly fixed, preallocated
 ### Summary
 Implemented a preallocated 4-way PublishedEntry heap with optimized sift-down, fixed free-slot stack, cache-separated locks, and allocation-free inline copies. Tests, build, ABI probes, and native benchmarks passed; pinned median was 4.78M ops/s.
 
+## Round 4 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully, exports the required ABI, and all six release Rust tests pass, including priority ordering, entry conservation, and allocation-free heap operations. Native ABI probes pass across inline, non-word-aligned, and 1 MiB values. The implementation appears correct and prior progress records a passing 100-trial trusted accuracy gate, although the Go checker cannot be rerun here because Go 1.19 lacks the evaluator's cmp and slices packages. The exact 4P/4C benchmark produced samples of 1,640,455, 1,615,441, and 1,642,275 total_ops_per_sec, with a median of 1,640,455, below the required strict threshold of 2,190,294. The previously recorded 2,190,293.56 also does not exceed that threshold.
+
+### Feedback
+Improve MPMC throughput so the official three-repetition median strictly exceeds 2,190,294 total_ops_per_sec; investigate publication-lock/heap contention and rerun the exact benchmark. Supply a modern Go toolchain if independent accuracy-gate verification is required.
+
