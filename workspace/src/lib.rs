@@ -208,7 +208,7 @@ impl SlotIndexHeap {
         Ok(Self { entries })
     }
 
-    #[inline]
+    #[inline(always)]
     fn peek(&self) -> Option<PublishedEntry> {
         self.entries.first().copied()
     }
@@ -232,44 +232,48 @@ impl SlotIndexHeap {
         self.entries[child] = entry;
     }
 
-    #[inline]
-    fn pop(&mut self) -> Option<PublishedEntry> {
+    #[inline(always)]
+    fn pop(&mut self, root: PublishedEntry) -> PublishedEntry {
         let length = self.entries.len();
-        if length == 0 {
-            return None;
-        }
-        let root = unsafe { *self.entries.as_ptr() };
+        debug_assert!(length != 0);
         let last_index = length - 1;
-        let last = unsafe { *self.entries.as_ptr().add(last_index) };
-        unsafe { self.entries.set_len(last_index) };
+        let entries = self.entries.as_mut_ptr();
         if last_index != 0 {
+            let carried = unsafe { entries.add(last_index).read() };
             let mut hole = 0;
             loop {
                 let left = hole * 2 + 1;
-                if left >= self.entries.len() {
+                if left >= last_index {
                     break;
                 }
                 let right = left + 1;
-                let child = if right < self.entries.len()
-                    && comes_before(self.entries[right], self.entries[left])
-                {
-                    right
-                } else {
-                    left
+                let (child, child_entry) = unsafe {
+                    let left_entry = entries.add(left).read();
+                    if right < last_index {
+                        let right_entry = entries.add(right).read();
+                        if comes_before(right_entry, left_entry) {
+                            (right, right_entry)
+                        } else {
+                            (left, left_entry)
+                        }
+                    } else {
+                        (left, left_entry)
+                    }
                 };
-                if !comes_before(self.entries[child], last) {
+                if !comes_before(child_entry, carried) {
                     break;
                 }
-                self.entries[hole] = self.entries[child];
+                unsafe { entries.add(hole).write(child_entry) };
                 hole = child;
             }
-            self.entries[hole] = last;
+            unsafe { entries.add(hole).write(carried) };
         }
-        Some(root)
+        unsafe { self.entries.set_len(last_index) };
+        root
     }
 }
 
-#[inline]
+#[inline(always)]
 fn comes_before(left: PublishedEntry, right: PublishedEntry) -> bool {
     left.priority < right.priority
         || (left.priority == right.priority && left.slot_index < right.slot_index)
@@ -495,10 +499,7 @@ impl Consumer {
             }
             // Removing the index transfers exclusive slot ownership to this
             // consumer. Do not hold publication while copying the payload.
-            let entry = published
-                .heap
-                .pop()
-                .expect("heap peek implies a heap item");
+            let entry = published.heap.pop(entry);
             (entry.slot_index, length)
         };
 
