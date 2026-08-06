@@ -217,3 +217,12 @@ Specialized `src/lib.rs` slot payloads with an inline per-slot `[u8; 8]` buffer 
 ### Summary
 Implemented inline [u8; 8] slot storage for max_value_size <= 8 with explicit lengths, preserving lazy reusable Vec storage for larger values. Added focused tests and built the shared library; native probes passed and MPMC median reached 2,388,141 ops/s.
 
+## Round 3 — Judge (attempt 1)
+- **verdict**: pass
+
+### Analysis
+Build succeeds and produces priority-queue-candidate.so with all required ABI symbols. Rust tests and native probes pass for inline sizes, lazy heap storage, non-word-aligned values, and 1 MiB values. The full 100-trial SPSC/MPSC/SPMC/MPMC accuracy gate passes. Source inspection confirms inline [u8; 8] storage without per-operation Vec allocation for max_value_size <= 8, and lazy reusable Vec storage above 8, with no benchmark-specific shortcut. The official default MPMC benchmark reports 2,133,242 ops/s; a repeated three-run median reached 1,799,887 ops/s, exceeding the 1,653,069 baseline.
+
+### Feedback
+
+
