@@ -128,11 +128,7 @@ impl<T> SpinMutex<T> {
             {
                 return SpinMutexGuard { mutex: self };
             }
-
             for _ in 0..LOCK_SPIN_ATTEMPTS {
-                if !self.locked.load(Ordering::Relaxed) {
-                    break;
-                }
                 spin_loop();
             }
 
