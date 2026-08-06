@@ -5,7 +5,7 @@ mod ffi;
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const ABI_VERSION: u32 = 1;
@@ -256,43 +256,125 @@ struct PublishedState {
 #[derive(Clone, Copy)]
 struct RootObservation {
     priority: u64,
+    sequence: u64,
 }
 
-// Readers use this acquire/release root summary to inspect a shard without
-// taking its heap lock. The heap remains the source of truth, and the selected
-// shard is always revalidated under its lock before a removal.
+#[derive(Clone, Copy)]
+struct RootCache {
+    priority: u64,
+    sequence: u64,
+    present: bool,
+}
+
+// A root has one more possible state than a u64 priority (empty plus every
+// possible priority, including u64::MAX). Keep the state in two atomics, but
+// publish them through a sequence counter. Readers accept a pair only when
+// they observed the same even sequence number before and after both fields.
+// Writers are serialized by the shard lock, while readers do not need that
+// lock just to inspect a root.
 #[repr(align(64))]
 struct RootSummary {
+    sequence: AtomicU64,
     priority: AtomicU64,
-    max_priority_present: AtomicBool,
 }
+
+const ROOT_PRESENT_BIT: u64 = 1 << 63;
+const ROOT_VERSION_MASK: u64 = ROOT_PRESENT_BIT - 1;
 
 impl RootSummary {
     fn new() -> Self {
         Self {
+            sequence: AtomicU64::new(0),
             priority: AtomicU64::new(u64::MAX),
-            max_priority_present: AtomicBool::new(false),
         }
     }
 
     fn publish(&self, entry: Option<PublishedEntry>) {
-        let priority = entry.map_or(u64::MAX, |entry| entry.priority);
-        self.priority.store(priority, Ordering::Relaxed);
-        self.max_priority_present.store(
-            entry.is_some_and(|entry| entry.priority == u64::MAX),
+        // The odd sequence marks the two fields as transient. The even
+        // sequence after the stores makes one complete root state visible.
+        let current = self.sequence.load(Ordering::Relaxed);
+        let version = current & ROOT_VERSION_MASK;
+        self.sequence.store(version | 1, Ordering::Release);
+        self.priority
+            .store(entry.map_or(u64::MAX, |entry| entry.priority), Ordering::Relaxed);
+        let next_version = version.wrapping_add(2) & ROOT_VERSION_MASK;
+        self.sequence.store(
+            next_version | if entry.is_some() { ROOT_PRESENT_BIT } else { 0 },
             Ordering::Release,
         );
     }
 
-    #[inline]
-    fn observe(&self) -> Option<RootObservation> {
-        let priority = self.priority.load(Ordering::Relaxed);
-        if priority != u64::MAX {
-            return Some(RootObservation { priority });
+    #[inline(always)]
+    fn read(&self) -> RootCache {
+        loop {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+
+            if before & ROOT_PRESENT_BIT == 0 {
+                let after = self.sequence.load(Ordering::Acquire);
+                if before == after {
+                    return RootCache {
+                        priority: u64::MAX,
+                        sequence: after,
+                        present: false,
+                    };
+                }
+                continue;
+            }
+
+            let priority = self.priority.load(Ordering::Relaxed);
+            let after = self.sequence.load(Ordering::Acquire);
+            if before == after && after & 1 == 0 {
+                return RootCache {
+                    priority,
+                    sequence: after,
+                    present: after & ROOT_PRESENT_BIT != 0,
+                };
+            }
         }
-        self.max_priority_present
-            .load(Ordering::Acquire)
-            .then_some(RootObservation { priority })
+    }
+
+    #[inline(always)]
+    fn observe(&self) -> Option<RootObservation> {
+        let root = self.read();
+        root.present.then_some(RootObservation {
+            priority: root.priority,
+            sequence: root.sequence,
+        })
+    }
+}
+
+// Exact count of nonempty publication shards. It is updated only on an
+// empty/nonempty transition, so the apparent-empty dequeue path can validate
+// emptiness without taking every shard lock.
+#[repr(align(64))]
+struct PublishedShardCount {
+    value: AtomicUsize,
+}
+
+impl PublishedShardCount {
+    fn new() -> Self {
+        Self {
+            value: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn load(&self) -> usize {
+        self.value.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn increment(&self) {
+        self.value.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    fn decrement(&self) {
+        self.value.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -317,6 +399,7 @@ struct QueueState {
     max_value_size: usize,
     slots: Vec<UnsafeCell<Slot>>,
     reservation: SpinMutex<ReservationState>,
+    published_shard_count: PublishedShardCount,
     publication_shards: Vec<PublicationShard>,
 }
 
@@ -394,6 +477,7 @@ impl Queue {
                 max_value_size,
                 slots,
                 reservation: SpinMutex::new(ReservationState { free_slots }),
+                published_shard_count: PublishedShardCount::new(),
                 publication_shards,
             }),
         })
@@ -460,6 +544,9 @@ impl Producer {
             if root_priority(next_root) != previous_root {
                 shard.root.publish(next_root);
             }
+            if previous_root.is_none() {
+                self.state.published_shard_count.increment();
+            }
         }
         STATUS_OK
     }
@@ -491,7 +578,12 @@ impl Consumer {
                 }
             }
             let Some((shard_index, _observation)) = selected else {
-                return Err(STATUS_EMPTY);
+                // Root summaries are optimistic reads. Confirm an apparent
+                // empty queue against every exact heap before returning EMPTY.
+                if self.confirm_empty() {
+                    return Err(STATUS_EMPTY);
+                }
+                continue;
             };
 
             let shard = &self.state.publication_shards[shard_index];
@@ -500,35 +592,46 @@ impl Consumer {
                 continue;
             };
 
-            // The optimistic root only identifies a likely winner. If that
-            // shard changed before its lock was acquired, use its current
-            // heap root and validate it against the shard-root observations
-            // while retaining the selected lock. A changed selected root
-            // triggers fresh observations for the other shards.
-            let selected_root_unchanged = observations[shard_index]
-                .is_some_and(|root| root.priority == current.priority);
-            let another_shard_has_lower_root = if selected_root_unchanged {
-                observations.iter().enumerate().any(|(candidate_index, candidate)| {
-                    candidate_index != shard_index
-                        && candidate.is_some_and(|candidate_root| {
-                            candidate_root.priority < current.priority
-                        })
-                })
-            } else {
-                self.state
-                    .publication_shards
-                    .iter()
-                    .enumerate()
-                    .any(|(candidate_index, candidate)| {
-                        candidate_index != shard_index
-                            && candidate
-                                .root
-                                .observe()
-                                .is_some_and(|candidate_root| {
-                                    candidate_root.priority < current.priority
-                                })
-                    })
-            };
+            // The selected heap root must still match the observation. A
+            // changed root means a concurrent operation changed this shard,
+            // so restart the global selection before touching the payload.
+            if observations[shard_index]
+                .is_none_or(|observation| observation.priority != current.priority)
+            {
+                continue;
+            }
+
+            // Re-read every other shard after acquiring the selected lock.
+            // The selected heap is exact under its lock. A synchronized root
+            // observation that is lower than the selected root invalidates
+            // this attempt; changes after these reads overlap this dequeue
+            // and may be ordered after it.
+            let another_shard_has_lower_root = self
+                .state
+                .publication_shards
+                .iter()
+                .enumerate()
+                .any(|(candidate_index, candidate_shard)| {
+                    if candidate_index == shard_index {
+                        return false;
+                    }
+                    let Some(observation) = observations[candidate_index] else {
+                        return candidate_shard
+                            .root
+                            .observe()
+                            .is_some_and(|candidate_root| {
+                                candidate_root.priority < current.priority
+                            });
+                    };
+                    if candidate_shard.root.sequence.load(Ordering::Acquire) == observation.sequence
+                    {
+                        return false;
+                    }
+                    candidate_shard
+                        .root
+                        .observe()
+                        .is_some_and(|candidate_root| candidate_root.priority < current.priority)
+                });
             if another_shard_has_lower_root {
                 continue;
             }
@@ -547,6 +650,9 @@ impl Consumer {
             if root_priority(next_root) != Some(entry.priority) {
                 shard.root.publish(next_root);
             }
+            if next_root.is_none() {
+                self.state.published_shard_count.decrement();
+            }
             break (entry.slot_index, length);
         };
 
@@ -561,6 +667,10 @@ impl Consumer {
         let mut reservation = self.state.reservation.lock();
         reservation.free_slots.push(slot_index);
         Ok(length)
+    }
+
+    fn confirm_empty(&self) -> bool {
+        self.state.published_shard_count.load() == 0
     }
 }
 
@@ -583,6 +693,31 @@ mod tests {
             assert_eq!(consumer.try_dequeue(&mut output), Ok(expected.len()));
             assert_eq!(&output[..expected.len()], expected);
         }
+        assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+    }
+
+    #[test]
+    fn maximum_priority_is_distinct_from_empty() {
+        let root = RootSummary::new();
+        assert!(root.observe().is_none());
+        root.publish(Some(PublishedEntry {
+            priority: u64::MAX,
+            slot_index: 0,
+        }));
+        assert_eq!(
+            root.observe().map(|observation| observation.priority),
+            Some(u64::MAX)
+        );
+        root.publish(None);
+        assert!(root.observe().is_none());
+
+        let queue = Queue::new(2, 1, 1, 1).unwrap();
+        let producer = queue.producer(0).unwrap();
+        let consumer = queue.consumer(0).unwrap();
+        assert_eq!(producer.try_enqueue(u64::MAX, &[0x5a]), STATUS_OK);
+        let mut output = [0_u8; 1];
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(1));
+        assert_eq!(output, [0x5a]);
         assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
     }
 

@@ -238,6 +238,7 @@ Build succeeds and produces priority-queue-candidate.so with all required ABI sy
 
 ## Round 3 — Framework accuracy gate (attempt 1)
 - **verdict**: pass
+
 - **command**: `go -C _evaluator/priority-queue run . check --workspace ../.. --scenario mpmc --operations 24 --trials 100`
 
 ### Output
@@ -401,4 +402,15 @@ The candidate builds successfully, exports the required ABI, passes Rust tests, 
 
 ### Feedback
 Fix root-summary synchronization and global-min validation so stale or missed shard summaries cannot produce a non-minimum dequeue or false EMPTY; use a synchronized version/state representation and revalidate all relevant shards. Handle priority u64::MAX without the current split-store race. Then rerun the official benchmark and improve its three-run median above 6,179,290 ops/sec.
+
+## Round 9 — Final Implementer Summary
+
+Implemented the synchronized M5 publication-sharding slice in `src/lib.rs`: two capacity-aware cache-line-aligned shards own exact slot-index heaps and independent short-held locks; slot indices route deterministically; producers copy before publishing under only the destination shard lock; consumers scan all roots, revalidate the selected shard and other shard sequence tokens, and retry stale observations. A versioned root state carries presence separately from the priority value, including `u64::MAX`, and an exact nonempty-shard count preserves publication-only `EMPTY` without a global publication mutex.
+
+Release tests, shared-library build, ABI symbol checks, and native probes for small capacities, arbitrary/non-word-aligned values, large values, ownership, output retention, and concurrent dequeue behavior passed. The bundled Go benchmark remains unavailable because the environment has no usable GOROOT; direct native benchmark runs were performed during tuning.
+## Round 8 — Implementer (attempt 2)
+- **expected_behavior**: The queue preserves minimum-priority dequeue, reservation-aware FULL/EMPTY semantics, ownership copying, output retention, arbitrary value sizes, and ABI compatibility without a global publication lock.
+
+### Summary
+Implemented synchronized sharded publication in src/lib.rs with exact global-min validation, versioned root summaries supporting u64::MAX, deterministic shard routing, and publication-only EMPTY handling. Tests, builds, ABI checks, and native probes passed; progress.md was updated.
 
