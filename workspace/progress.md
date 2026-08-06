@@ -134,3 +134,12 @@ The candidate exports the required ABI, reports reservation-aware `FULL`, public
 ### Summary
 Optimized M2 synchronization with separate cache-aligned spin locks, heap-owned priority/index entries, and payload copying outside shared locks. Validation passed; 10-second MPMC median was 1,340,644 ops/sec. Appended progress.md summary.
 
+## Round 2 — Judge (attempt 2)
+- **verdict**: pass
+
+### Analysis
+Build succeeds and produces ./priority-queue-candidate.so with all required ABI symbols. Rust tests, evaluator tests, native ABI probes, and the full 100-trial SPSC/MPSC/SPMC/MPMC accuracy gate pass. Ownership, bounds, empty/full behavior, priority ordering, reservation-aware MPMC semantics, and conservation are correct. Separate reservation and publication spinlocks ensure no single mutex covers payload copying and heap access; slot ownership prevents payload races. The official MPMC benchmark reports samples of 1,232,788, 1,850,541, and 1,521,182 successful ops/sec, with a median of 1,521,182, exceeding the 843,086 threshold.
+
+### Feedback
+
+
