@@ -47,6 +47,7 @@ impl Slot {
         Self { storage }
     }
 
+    #[inline(always)]
     fn copy_value(&mut self, data: &[u8]) -> Result<(), ()> {
         match &mut self.storage {
             SlotStorage::Inline { bytes, length } => {
@@ -66,7 +67,7 @@ impl Slot {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn len(&self) -> usize {
         match &self.storage {
             SlotStorage::Inline { length, .. } => *length,
@@ -74,7 +75,7 @@ impl Slot {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn copy_to(&self, output: &mut [u8]) {
         match &self.storage {
             SlotStorage::Inline { bytes, length } => {
@@ -88,6 +89,7 @@ impl Slot {
         }
     }
 
+    #[inline(always)]
     fn clear(&mut self) {
         match &mut self.storage {
             SlotStorage::Inline { length, .. } => *length = 0,
@@ -114,7 +116,7 @@ impl<T> SpinMutex<T> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn lock(&self) -> SpinMutexGuard<'_, T> {
         loop {
             if self
@@ -149,18 +151,21 @@ unsafe impl<T: Send> Send for SpinMutex<T> {}
 impl<T> Deref for SpinMutexGuard<'_, T> {
     type Target = T;
 
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.mutex.value.get() }
     }
 }
 
 impl<T> DerefMut for SpinMutexGuard<'_, T> {
+    #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.mutex.value.get() }
     }
 }
 
 impl<T> Drop for SpinMutexGuard<'_, T> {
+    #[inline(always)]
     fn drop(&mut self) {
         self.mutex.locked.store(false, Ordering::Release);
     }
@@ -240,11 +245,6 @@ fn comes_before(left: PublishedEntry, right: PublishedEntry) -> bool {
         || (left.priority == right.priority && left.slot_index < right.slot_index)
 }
 
-#[inline]
-fn root_priority(entry: Option<PublishedEntry>) -> Option<u64> {
-    entry.map(|entry| entry.priority)
-}
-
 struct ReservationState {
     free_slots: Vec<usize>,
 }
@@ -282,6 +282,7 @@ const ROOT_PRESENT_BIT: u64 = 1 << 63;
 const ROOT_VERSION_MASK: u64 = ROOT_PRESENT_BIT - 1;
 
 impl RootSummary {
+    #[inline(always)]
     fn new() -> Self {
         Self {
             sequence: AtomicU64::new(0),
@@ -401,6 +402,7 @@ struct QueueState {
     reservation: SpinMutex<ReservationState>,
     published_shard_count: PublishedShardCount,
     publication_shards: Vec<PublicationShard>,
+    publication_shard_mask: usize,
 }
 
 // A slot is owned by exactly one phase at a time:
@@ -479,6 +481,7 @@ impl Queue {
                 reservation: SpinMutex::new(ReservationState { free_slots }),
                 published_shard_count: PublishedShardCount::new(),
                 publication_shards,
+                publication_shard_mask: shard_count - 1,
             }),
         })
     }
@@ -495,7 +498,7 @@ impl Queue {
         (id < self.consumer_count)
             .then(|| Consumer {
                 state: Arc::clone(&self.state),
-                shard_start: ((id as usize) + 1) % self.state.publication_shards.len(),
+                shard_start: ((id as usize) + 1) & self.state.publication_shard_mask,
             })
             .ok_or(STATUS_INVALID)
     }
@@ -529,22 +532,22 @@ impl Producer {
             return STATUS_INTERNAL_ERROR;
         }
         {
-            let shard_index = slot_index % self.state.publication_shards.len();
+            let shard_index = slot_index & self.state.publication_shard_mask;
             let shard = &self.state.publication_shards[shard_index];
             let mut published = shard.published.lock();
 
             // Publication is short-held and only touches heap/index metadata.
             // The payload was fully copied before this lock was acquired.
-            let previous_root = root_priority(published.heap.peek());
+            let previous_root_priority = published.heap.peek().map(|entry| entry.priority);
             published.heap.push(PublishedEntry {
                 priority,
                 slot_index,
             });
             let next_root = published.heap.peek();
-            if root_priority(next_root) != previous_root {
+            if next_root.map(|entry| entry.priority) != previous_root_priority {
                 shard.root.publish(next_root);
             }
-            if previous_root.is_none() {
+            if previous_root_priority.is_none() {
                 self.state.published_shard_count.increment();
             }
         }
@@ -564,10 +567,14 @@ impl Consumer {
                 [None; PUBLICATION_SHARD_COUNT];
             let mut selected: Option<(usize, RootObservation)> = None;
             let shard_count = self.state.publication_shards.len();
-            for offset in 0..shard_count {
-                let shard_index = (self.shard_start + offset) % shard_count;
+            let mut shard_index = self.shard_start;
+            for _ in 0..shard_count {
                 let shard = &self.state.publication_shards[shard_index];
                 let Some(observation) = shard.root.observe() else {
+                    shard_index += 1;
+                    if shard_index == shard_count {
+                        shard_index = 0;
+                    }
                     continue;
                 };
                 observations[shard_index] = Some(observation);
@@ -575,6 +582,10 @@ impl Consumer {
                     observation.priority < current.priority
                 }) {
                     selected = Some((shard_index, observation));
+                }
+                shard_index += 1;
+                if shard_index == shard_count {
+                    shard_index = 0;
                 }
             }
             let Some((shard_index, _observation)) = selected else {
@@ -592,12 +603,15 @@ impl Consumer {
                 continue;
             };
 
-            // The selected heap root must still match the observation. A
-            // changed root means a concurrent operation changed this shard,
-            // so restart the global selection before touching the payload.
-            if observations[shard_index]
-                .is_none_or(|observation| observation.priority != current.priority)
-            {
+            // The selected heap root must still match the observed priority.
+            // A changed priority means a concurrent operation changed this
+            // shard, so restart the global selection before touching the
+            // payload. Changes among equal priorities do not affect the
+            // minimum and are allowed to be returned in either order.
+            let Some(observation) = observations[shard_index] else {
+                continue;
+            };
+            if observation.priority != current.priority {
                 continue;
             }
 
@@ -647,7 +661,7 @@ impl Consumer {
                 .pop()
                 .expect("heap peek implies a heap item");
             let next_root = published.heap.peek();
-            if root_priority(next_root) != Some(entry.priority) {
+            if next_root.map(|next| next.priority) != Some(entry.priority) {
                 shard.root.publish(next_root);
             }
             if next_root.is_none() {

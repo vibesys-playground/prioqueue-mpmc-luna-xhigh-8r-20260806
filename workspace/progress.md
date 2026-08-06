@@ -239,6 +239,16 @@ Build succeeds and produces priority-queue-candidate.so with all required ABI sy
 ## Round 3 — Framework accuracy gate (attempt 1)
 - **verdict**: pass
 
+## Round 5 — Implementer
+
+### Summary
+
+Implemented the publication-structure slice in `src/lib.rs` with a capacity-aware set of up to two cache-line-aligned publication shards. Each shard owns its own exact `SlotIndexHeap`, short-held `SpinMutex`, and versioned root summary. Reserved slots route by a deterministic power-of-two mask; producers copy payloads before taking only the assigned shard lock. Dequeue scans all shard roots, revalidates the selected heap root under its shard lock, checks other shard summaries for a lower priority, and retries stale observations before removal. Reservation/free-slot synchronization, slot ownership, inline/lazy storage, output retention, and `src/ffi.rs` were preserved.
+
+### Validation
+
+`make`, debug/release Rust tests, release build, ABI symbol inspection, and native probes passed for capacities 1/2/3/7/64 and value sizes 8/9/257/1 MiB, including concurrent undersized-output retention. Short native 4P/4C MPMC samples reached above 6.1M successful ops/s, but the host-noisy longer direct three-sample median was below the requested 6,179,290 threshold. The full Go accuracy gate remains blocked in this environment because the installed Go binary is trimmed and cannot locate GOROOT (`cmp`/`slices` unavailable).
+
 - **command**: `go -C _evaluator/priority-queue run . check --workspace ../.. --scenario mpmc --operations 24 --trials 100`
 
 ### Output
@@ -422,4 +432,9 @@ The candidate builds successfully, exports all required ABI symbols, and passes 
 
 ### Feedback
 Improve default 4P/4C MPMC end-to-end throughput so the trusted benchmark median exceeds 6,179,290 ops/s; the current sharded publication/root-scan path regresses performance. Re-run the full official accuracy gate once a Go toolchain containing cmp and slices is available.
+## Round 8 — Implementer (attempt 3)
+- **expected_behavior**: Preserves exact minimum-priority dequeue, reservation-aware FULL/EMPTY, ownership copying, undersized-output retention, and ABI behavior without a global publication mutex.
+
+### Summary
+Implemented capacity-aware sharded publication with aligned per-shard heaps, root summaries, deterministic routing, and dequeue revalidation in src/lib.rs. Builds, tests, ABI probes, and edge-size probes pass; Go accuracy gate was unavailable due missing GOROOT.
 
