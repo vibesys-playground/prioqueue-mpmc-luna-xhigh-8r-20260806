@@ -217,12 +217,16 @@ impl<T> Drop for SpinMutexGuard<'_, T> {
     }
 }
 
-struct SlotIndexHeap {
+// The publication lock is the queue's remaining shared hot spot. Keep its
+// heap as a fixed-capacity array of the complete publication records so heap
+// maintenance never has to touch slot payload storage or allocate.
+struct PublishedEntryHeap {
     entries: Vec<MaybeUninit<PublishedEntry>>,
     length: usize,
 }
 
 const HEAP_ARITY: usize = 4;
+const HEAP_ARITY_SHIFT: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PublishedEntry {
@@ -230,7 +234,7 @@ struct PublishedEntry {
     slot_index: usize,
 }
 
-impl SlotIndexHeap {
+impl PublishedEntryHeap {
     fn new(capacity: usize) -> Result<Self, u32> {
         let mut entries = Vec::<MaybeUninit<PublishedEntry>>::new();
         entries
@@ -264,7 +268,7 @@ impl SlotIndexHeap {
         debug_assert!(child < self.entries.len());
         self.length = child + 1;
         while child != 0 {
-            let parent = (child - 1) / HEAP_ARITY;
+            let parent = (child - 1) >> HEAP_ARITY_SHIFT;
             let parent_entry = unsafe { self.entry(parent) };
             if !comes_before(entry, parent_entry) {
                 break;
@@ -292,9 +296,9 @@ impl SlotIndexHeap {
             // establish all four child bounds. This is the common path for a
             // queue-sized heap and avoids three bounds branches per level.
             while new_length >= HEAP_ARITY + 1
-                && parent <= (new_length - (HEAP_ARITY + 1)) / HEAP_ARITY
+                && parent <= (new_length - (HEAP_ARITY + 1)) >> HEAP_ARITY_SHIFT
             {
-                let first_child = parent * HEAP_ARITY + 1;
+                let first_child = (parent << HEAP_ARITY_SHIFT) + 1;
                 let mut child = first_child;
                 let mut child_entry = unsafe { self.entry(child) };
 
@@ -324,7 +328,7 @@ impl SlotIndexHeap {
             // Only the final partial child group needs per-child bounds
             // checks. It has at most three comparisons and normally executes
             // once.
-            let first_child = parent * HEAP_ARITY + 1;
+            let first_child = (parent << HEAP_ARITY_SHIFT) + 1;
             if first_child < new_length {
                 let mut child = first_child;
                 let mut child_entry = unsafe { self.entry(child) };
@@ -382,7 +386,7 @@ impl FreeSlotStack {
 }
 
 struct PublishedState {
-    heap: SlotIndexHeap,
+    heap: PublishedEntryHeap,
 }
 
 struct QueueState {
@@ -459,7 +463,7 @@ impl Queue {
                 slots,
                 reservation: SpinMutex::new(ReservationState { free_slots }),
                 published: SpinMutex::new(PublishedState {
-                    heap: SlotIndexHeap::new(capacity)?,
+                    heap: PublishedEntryHeap::new(capacity)?,
                 }),
             }),
         })
@@ -645,7 +649,7 @@ mod tests {
 
     #[test]
     fn four_way_heap_preserves_entry_order_and_capacity() {
-        let mut heap = SlotIndexHeap::new(16).unwrap();
+        let mut heap = PublishedEntryHeap::new(16).unwrap();
         let initial_capacity = heap.entries.capacity();
         let entries = [
             PublishedEntry {
@@ -795,7 +799,7 @@ mod tests {
     #[test]
     fn four_way_heap_handles_all_child_group_shapes() {
         for capacity in 1..=128 {
-            let mut heap = SlotIndexHeap::new(capacity).unwrap();
+            let mut heap = PublishedEntryHeap::new(capacity).unwrap();
             let mut expected = Vec::with_capacity(capacity);
             let mut state = capacity as u64;
             for slot_index in 0..capacity {

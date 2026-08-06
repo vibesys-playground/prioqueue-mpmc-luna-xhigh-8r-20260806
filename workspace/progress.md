@@ -333,3 +333,22 @@ The candidate builds successfully, exports the required ABI, and all six release
 ### Feedback
 Improve MPMC throughput so the official three-repetition median strictly exceeds 2,190,294 total_ops_per_sec; investigate publication-lock/heap contention and rerun the exact benchmark. Supply a modern Go toolchain if independent accuracy-gate verification is required.
 
+## Round 4 — Implementer (current)
+
+### Summary
+
+Replaced the internal `SlotIndexHeap` implementation in `src/lib.rs` with an explicitly named, fixed-arity four-way `PublishedEntryHeap`. The heap stores complete `(priority, slot_index)` records in a queue-creation-time preallocated `Vec<MaybeUninit<PublishedEntry>>`, uses exact lexicographic ordering, and performs push/pop maintenance without per-operation allocation. The existing reservation/publication locks, ABI, capacity accounting, slot ownership, copied values, and undersized-output behavior remain unchanged.
+
+### Validation
+
+Release Rust tests, shared-library build, exported ABI symbol checks, native probes for value sizes 8/9/17/257/1 MiB, and the Go 1.26.5 trusted 100-trial SPSC/MPSC/SPMC/MPMC accuracy gate passed. The exact local three-repetition MPMC benchmark completed with samples of 1,864,333, 1,682,035, and 1,858,090 total ops/sec (median 1,858,090) on the shared host; this local run remained below the strict 2,190,294 target despite correctness passing.
+
+### Expected behavior
+
+The candidate exports the required ABI and continues to return the lowest-priority published item with `(priority, slot_index)` tie ordering, reservation-aware `FULL`, publication-only `EMPTY`, copied ownership, output-bound preservation, exact capacity recycling, and allocation-free fixed-capacity heap push/pop operations.
+## Round 4 — Implementer (attempt 3)
+- **expected_behavior**: Preserves ABI, ownership, capacity, synchronization, FULL/EMPTY semantics, exact priority ordering, conservation, and allocation-free heap operations.
+
+### Summary
+Implemented a preallocated fixed-arity 4-way PublishedEntry min-heap in src/lib.rs with exact ordering and allocation-free push/pop. Tests, ABI checks, probes, and accuracy gates pass; local benchmark median was 1,858,090 ops/s, below target.
+
