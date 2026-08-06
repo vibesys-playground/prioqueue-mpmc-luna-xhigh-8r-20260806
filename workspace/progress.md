@@ -300,3 +300,12 @@ Replaced the publication path's binary `SlotIndexHeap` sift logic with a fixed-a
 ### Summary
 Replaced the binary SlotIndexHeap with a preallocated fixed-arity 4-way PublishedEntry min-heap, preserving exact ordering and zero per-operation allocation. Rust tests, release build, native probes, and ABI checks passed.
 
+## Round 4 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The candidate builds priority-queue-candidate.so and exports the required ABI. Debug/release Rust tests pass, including exact 4-way heap ordering, entry conservation, and stable heap capacity. The evaluator’s 100-trial MPMC accuracy gate passes, as do ABI probes for copied ownership, bounds, empty/invalid dequeue behavior, non-word-aligned values, 1 MiB values, concurrent conservation, and all scenario checks. However, the official 4P/4C MPMC benchmark produced samples of approximately 1.527M, 1.740M, and 2.314M total ops/sec; the median was 1,740,431, below the required 2,190,294. No benchmark-specific shortcut was found.
+
+### Feedback
+The fixed-arity heap implementation is correct but fails the headline performance gate and regresses the prior reference. Rework or revert the publication-path optimization, focusing on reducing publication-lock hold time and heap sift-down child comparisons, then rerun the exact manifest benchmark until the 3-run median exceeds 2,190,294 total_ops_per_sec.
+
