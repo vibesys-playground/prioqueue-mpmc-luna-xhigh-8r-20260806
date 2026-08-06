@@ -106,3 +106,12 @@ Replaced the single `values` mutex with independent reservation/free-slot and pu
 ### Summary
 Implemented M2 synchronization split with separate reservation/free-slot and published-heap mutexes, exclusive slot ownership, and payload copying outside shared locks. Built and validated the candidate with native probes and benchmarks; median MPMC throughput was 1,000,649 ops/sec.
 
+## Round 2 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+Build and ABI checks pass. Rust tests pass, all trusted SPSC/MPSC/SPMC/MPMC accuracy scenarios pass 100 trials, native ABI probes pass including 257-byte and 1 MiB values, and conservation/ownership/bounds behavior is correct. The implementation uses separate reservation and publication mutexes; payload copying is outside both, satisfying the mutex criterion. However, the official MPMC benchmark reports samples of 735487.56, 706115.11, and 746622.07 ops/sec, with median 735488, below the required round-1 median of 843086.
+
+### Feedback
+Improve MPMC throughput so the official 3-repetition benchmark median exceeds 843086 total_ops_per_sec. Correctness currently passes, but the performance criterion fails; focus on publication-heap contention and synchronization overhead.
+
