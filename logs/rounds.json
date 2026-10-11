@@ -1,0 +1,66 @@
+[
+  {
+    "round": 1,
+    "commit": "da43508a7647440e7310910f33927317db7738e8",
+    "perf_metric": 843085.826356,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 2,
+    "commit": "2e2e2471a8d634e458b86e1f49850e3e6eb52d2c",
+    "perf_metric": 1653069.242532,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 3,
+    "commit": "626274a0f6dfb98e0abccd7da2588e7945652232",
+    "perf_metric": 2190293.560854,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 4,
+    "commit": "0e040426cf6753f7779f9a87d6569cd1c2f437bd",
+    "perf_metric": null,
+    "perf_unit": null,
+    "passed": false,
+    "profile_skipped": true
+  },
+  {
+    "round": 5,
+    "commit": "66a016ea1779809015865689aa789d2d4a83fb03",
+    "perf_metric": null,
+    "perf_unit": null,
+    "passed": false,
+    "profile_skipped": true
+  },
+  {
+    "round": 6,
+    "commit": "84c7b2ef2aa4a4d7557971ac4dd77465739b0e29",
+    "perf_metric": null,
+    "perf_unit": null,
+    "passed": false,
+    "profile_skipped": true
+  },
+  {
+    "round": 7,
+    "commit": "106b51f83624cc9de1f885291dbef8f07651f83d",
+    "perf_metric": 6179289.876765,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 8,
+    "commit": "15dd6f5dd2d0853ad3d564f1955659c832c4ed56",
+    "perf_metric": null,
+    "perf_unit": null,
+    "passed": false,
+    "profile_skipped": true
+  }
+]
